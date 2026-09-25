@@ -1210,7 +1210,7 @@ def _wiki_random_page_text(lang: str='pt'):
     return (title, page.get('extract', ''))
 
 
-def _wiki_training_loop(model, pretrain_opt, rl_opt, sup_opt, state, loss_target: float=0.7, max_steps_por_pagina: int=2000):
+def _wiki_training_loop(model, pretrain_opt, rl_opt, sup_opt, state, loss_target: float=0.4, max_steps_por_pagina: int=2000):
     console.print('[bold cyan]📖 Loop de treino com Wikipedia iniciado (--wiki)[/bold cyan]')
     while True:
         try:
