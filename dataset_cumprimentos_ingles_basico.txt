@@ -1,0 +1,85 @@
+# MINI DATASET - CUMPRIMENTOS E INGLÊS BÁSICO
+# Formato: pergunta/frase -> resposta esperada
+# Objetivo: treino inicial de um modelo de linguagem "recém-nascido"
+
+## SAUDAÇÕES (GREETINGS)
+Hello! -> Hi! How are you?
+Hi! -> Hello! Nice to meet you.
+Good morning! -> Good morning! Did you sleep well?
+Good afternoon! -> Good afternoon! How is your day?
+Good evening! -> Good evening! Are you having dinner?
+Good night! -> Good night! Sleep well.
+Hey! -> Hey! What's up?
+Howdy! -> Howdy! Good to see you.
+
+## APRESENTAÇÕES (INTRODUCTIONS)
+What is your name? -> My name is Anna.
+Nice to meet you. -> Nice to meet you too.
+How old are you? -> I am ten years old.
+Where are you from? -> I am from Brazil.
+What do you do? -> I am a student.
+
+## COMO ESTÁ (HOW ARE YOU)
+How are you? -> I am fine, thank you.
+How are you doing? -> I am doing great!
+Are you okay? -> Yes, I am okay.
+How is everything? -> Everything is good.
+
+## CORTESIA (POLITENESS)
+Please. -> Of course.
+Thank you. -> You're welcome.
+Thanks a lot. -> No problem.
+Excuse me. -> Yes, how can I help?
+I'm sorry. -> That's okay.
+Can you help me? -> Sure, I can help you.
+
+## DESPEDIDAS (FAREWELLS)
+Goodbye! -> Goodbye! Take care.
+Bye! -> Bye! See you soon.
+See you later! -> See you later!
+See you tomorrow! -> See you tomorrow!
+Take care! -> You too, take care!
+Have a nice day! -> Thank you, you too!
+
+## RESPOSTAS BÁSICAS (BASIC ANSWERS)
+Yes. -> Yes, that's right.
+No. -> No, that's not right.
+Maybe. -> Maybe, I'm not sure.
+I don't know. -> That's okay, let's find out.
+
+## NÚMEROS (NUMBERS)
+one -> 1
+two -> 2
+three -> 3
+four -> 4
+five -> 5
+six -> 6
+seven -> 7
+eight -> 8
+nine -> 9
+ten -> 10
+
+## DIAS DA SEMANA (DAYS OF THE WEEK)
+Monday -> segunda-feira
+Tuesday -> terça-feira
+Wednesday -> quarta-feira
+Thursday -> quinta-feira
+Friday -> sexta-feira
+Saturday -> sábado
+Sunday -> domingo
+
+## CORES (COLORS)
+red -> vermelho
+blue -> azul
+green -> verde
+yellow -> amarelo
+black -> preto
+white -> branco
+
+## FRASES CURTAS DE REFORÇO (SHORT REINFORCEMENT SENTENCES)
+Hello, my name is Tom.
+Hi, how are you today?
+Good morning, everyone!
+Thank you very much.
+See you tomorrow, bye!
+Nice to meet you, goodbye.
