@@ -34,7 +34,7 @@ def _stdin_watcher():
 _stdin_thread = threading.Thread(target=_stdin_watcher, daemon=True)
 _stdin_thread.start()
 SEED = 42
-CONTEXT_LEN = 256  # era 64 — muito curto para aprender dependências de frase/parágrafo
+CONTEXT_LEN = 64  # era 64 — muito curto para aprender dependências de frase/parágrafo
 PRETRAIN_STEPS = 3000
 PRETRAIN_LR = 0.0006  # era 0.003 — alto demais pra ~14M params, arriscava instabilidade
 PRETRAIN_LR_CONT = 0.0003  # era 0.0008
