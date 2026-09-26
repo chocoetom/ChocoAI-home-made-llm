@@ -375,7 +375,7 @@ class TinyAI(nn.Module):
 #      staleness simples, evita puxar o treino pra trás.
 FED_JOB_CONTENT_CHARS = 20000       # tamanho do pedaço de corpus mandado por job
 FED_MAX_STEPS_PER_JOB = 150         # teto de steps que um voluntário pode rodar por job
-FED_AGG_THRESHOLD = 3               # quantos deltas válidos esperar antes de agregar
+FED_AGG_THRESHOLD = 1               # aplica o delta assim que chega — evita acumular vários em RAM
 FED_JOB_TTL_SECONDS = 1800          # jobs emitidos e nunca respondidos expiram
 FED_MAX_PENDING_JOBS = 500          # limite de jobs "em aberto" guardados em memória
 
@@ -449,11 +449,21 @@ def _fed_issue_job(model: 'TinyAI', own_content: bool) -> dict:
         'max_steps': FED_MAX_STEPS_PER_JOB,
     }
     if not own_content:
-        if len(CORPUS) > FED_JOB_CONTENT_CHARS:
-            start = random.randint(0, len(CORPUS) - FED_JOB_CONTENT_CHARS)
-            payload['content'] = CORPUS[start:start + FED_JOB_CONTENT_CHARS]
-        else:
-            payload['content'] = CORPUS
+        if _WIKI_MODE:
+            try:
+                title, texto = _wiki_take_page()
+                payload['content'] = texto[:FED_JOB_CONTENT_CHARS]
+                payload['content_source'] = f'wikipedia:{title}'
+            except Exception as e:
+                console.print(f'[bold yellow]⚠️  Wikipedia falhou nesse job ({e}), caindo pro corpus local[/bold yellow]')
+                own_content = False  # cai no bloco abaixo via fallback manual
+        if not _WIKI_MODE or 'content' not in payload:
+            if len(CORPUS) > FED_JOB_CONTENT_CHARS:
+                start = random.randint(0, len(CORPUS) - FED_JOB_CONTENT_CHARS)
+                payload['content'] = CORPUS[start:start + FED_JOB_CONTENT_CHARS]
+            else:
+                payload['content'] = CORPUS
+            payload.setdefault('content_source', 'local_corpus')
     return payload
 
 
@@ -488,26 +498,26 @@ def _fed_submit_delta(model: 'TinyAI', job_id: str, version: int, n_steps: int, 
 
 
 def _fed_apply_pending(model: 'TinyAI') -> int:
-    """Faz a média ponderada (por n_steps) dos deltas pendentes e aplica no
-    modelo mestre. Chamado dentro de _server_lock em quem chama de fora, ou
-    aqui mesmo se for chamado isoladamente (idempotente com _fed_lock)."""
+    """Aplica os deltas pendentes direto nos tensores do modelo (in-place,
+    sob torch.no_grad()) em vez de montar cópias extras (zeros_like por
+    parâmetro + dict novo pro load_state_dict) — importante em container
+    com pouca RAM, onde cada cópia extra de ~50MB+ pode ser a diferença
+    entre rodar e OOM."""
     with _fed_lock:
         deltas = _fed_state['pending_deltas']
         _fed_state['pending_deltas'] = []
         if not deltas:
             return _fed_state['version']
         total_steps = sum(n for _, n, _ in deltas)
-        with _server_lock:
-            sd = model.state_dict()
-            for key in sd:
-                if not torch.is_floating_point(sd[key]):
+        with _server_lock, torch.no_grad():
+            sd = model.state_dict()  # tensores compartilhados com o modelo, não cópias
+            for key, tensor in sd.items():
+                if not torch.is_floating_point(tensor):
                     continue  # não mistura buffers inteiros (ex: máscara causal) na média
-                acc = torch.zeros_like(sd[key])
                 for delta, n_steps, _worker in deltas:
                     if key in delta:
-                        acc += delta[key].to(sd[key].dtype) * (n_steps / total_steps)
-                sd[key] = sd[key] + acc
-            model.load_state_dict(sd)
+                        tensor.add_(delta[key].to(tensor.dtype), alpha=n_steps / total_steps)
+        del sd
         _fed_state['version'] += 1
         _fed_state['stats']['aggregations'] += 1
         contributors = [w for _, _, w in deltas]
@@ -1397,46 +1407,49 @@ def _wiki_random_page_text(lang: str='pt'):
     return (title, _limpar_texto_wiki(texto_bruto))
 
 
-def _wiki_training_loop(model, pretrain_opt, rl_opt, sup_opt, state, loss_target: float=0.7, max_steps_por_pagina: int=2000):
-    console.print('[bold cyan]📖 Loop de treino com Wikipedia iniciado (--wiki)[/bold cyan]')
+# Prefetch simples de páginas da Wikipedia — o servidor SÓ busca e guarda o
+# texto pra distribuir nos jobs; quem treina com isso são os voluntários.
+_wiki_cache_lock = threading.Lock()
+_wiki_cache: list = []       # fila de (title, texto) já buscados, prontos pra usar
+_WIKI_CACHE_TARGET = 5        # quantas páginas manter prontas no buffer
+_WIKI_MODE = False            # setado por run_server(wiki=True)
+
+
+def _wiki_prefetch_loop():
+    console.print('[bold cyan]📖 Prefetch de conteúdo da Wikipedia iniciado (--federated --wiki)[/bold cyan]')
     while True:
+        with _wiki_cache_lock:
+            precisa = len(_wiki_cache) < _WIKI_CACHE_TARGET
+        if not precisa:
+            time.sleep(2)
+            continue
         try:
             title, texto = _wiki_random_page_text()
         except Exception as e:
             console.print(f'[bold red]⚠️  Falha ao buscar página da Wikipedia: {e}[/bold red]')
             time.sleep(5)
             continue
-        encoded = torch.tensor(encode(texto), dtype=torch.long)
-        if len(encoded) <= CONTEXT_LEN + 1:
+        if len(texto) <= CONTEXT_LEN + 1:
             continue
-        console.print(f"[cyan]📖 Wiki: '{title}' ({len(texto)} chars)[/cyan]")
-        step = 0
-        last_loss = None
-        while step < max_steps_por_pagina:
-            x, y = _get_batch_de_texto(encoded)
-            if x is None:
-                break
-            with _server_lock:
-                _, loss, _ = model(x, y)
-                pretrain_opt.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                pretrain_opt.step()
-            last_loss = loss.item()
-            step += 1
-            if step % 20 == 0:
-                console.print(f'   step {step}  loss={last_loss:.4f}')
-            if last_loss <= loss_target:
-                break
-        with _server_lock:
-            state['gen'] = state.get('gen', 0) + 1
-            save_checkpoint(model, rl_opt, sup_opt, state, CHECKPOINT_LAST, pretrain_opt=pretrain_opt)
-        motivo = 'atingiu loss alvo' if last_loss is not None and last_loss <= loss_target else 'limite de steps'
-        console.print(f"[bold green]✅ '{title}' concluída ({motivo}) — loss final={last_loss:.4f}, {step} steps. Checkpoint salvo.[/bold green]")
+        with _wiki_cache_lock:
+            _wiki_cache.append((title, texto))
+        console.print(f"[cyan]📖 Wiki em cache: '{title}' ({len(texto)} chars) — buffer: {len(_wiki_cache)}/{_WIKI_CACHE_TARGET}[/cyan]")
+
+
+def _wiki_take_page():
+    """Pega uma página pronta do cache pra mandar num job. Se o buffer estiver
+    vazio (raro, prefetch ainda não alcançou), busca uma na hora (bloqueia
+    esse request, mas não trava o servidor todo — sem lock de treino aqui)."""
+    with _wiki_cache_lock:
+        if _wiki_cache:
+            return _wiki_cache.pop(0)
+    title, texto = _wiki_random_page_text()
+    return title, texto
 
 
 def _build_flask_app(model, rl_opt, sup_opt, pretrain_opt, state, federated: bool=False):
     app = Flask(__name__)
+
 
     @app.route('/v1/model', methods=['GET'])
     def download_model():
@@ -1493,6 +1506,7 @@ def _build_flask_app(model, rl_opt, sup_opt, pretrain_opt, state, federated: boo
 
 
 def run_server(wiki: bool=False, host: str='0.0.0.0', port: int=5000, federated: bool=False):
+    global _WIKI_MODE
     if Flask is None:
         console.print('[bold red]❌ Flask não instalado. Rode: pip install flask[/bold red]')
         return
@@ -1500,13 +1514,15 @@ def run_server(wiki: bool=False, host: str='0.0.0.0', port: int=5000, federated:
     state = novo_estado_inicial()
     model, rl_opt, sup_opt, pretrain_opt = _carregar_ou_criar_modelo(state)
     if wiki:
-        t = threading.Thread(target=_wiki_training_loop, args=(model, pretrain_opt, rl_opt, sup_opt, state), daemon=True)
+        _WIKI_MODE = True
+        t = threading.Thread(target=_wiki_prefetch_loop, daemon=True)
         t.start()
     app = _build_flask_app(model, rl_opt, sup_opt, pretrain_opt, state, federated=federated)
     rotas = 'GET /v1/model, POST /v1/chat, GET /v1/status'
     if federated:
         rotas += ', GET /v1/job, POST /v1/submit'
-    console.print(f'[bold green]🚀 Servidor em http://{host}:{port}  ({rotas})[/bold green]\n')
+    fonte = 'Wikipedia (prefetch)' if wiki else 'corpus local'
+    console.print(f'[bold green]🚀 Servidor em http://{host}:{port}  ({rotas})  — conteúdo dos jobs: {fonte}[/bold green]\n')
     app.run(host=host, port=port, threaded=True)
 
 
