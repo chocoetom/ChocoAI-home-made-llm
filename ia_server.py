@@ -768,7 +768,7 @@ def pretrain(model, steps, lr, status_callback=None, opt=None):
             status_callback(step, steps, loss.item())
     return model
 
-def _get_batch_de_texto(texto_encoded: torch.Tensor, bs=16):  # era 4
+def _get_batch_de_texto(texto_encoded: torch.Tensor, bs=2):  # era 16, testando com carga menor
     max_i = len(texto_encoded) - CONTEXT_LEN - 1
     if max_i <= 0:
         return (None, None)
