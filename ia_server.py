@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import subprocess, sys, time, random, math, os, threading, queue, select, csv
-import io, gzip, base64, inspect, uuid
+import io, gzip, base64, inspect, uuid, heapq, json as _json
 from collections import deque
 from rich.live import Live
 from rich.panel import Panel
@@ -19,7 +19,7 @@ try:
 except ImportError:
     Flask = None
 console = Console()
-_server_lock = threading.Lock()
+_server_lock = threading.RLock()  # RLock: precisa ser reentrante (algumas funções federadas se chamam em cadeia já segurando o lock)
 _cmd_queue: 'queue.Queue[str]' = queue.Queue()
 
 def _stdin_watcher():
@@ -35,9 +35,12 @@ def _stdin_watcher():
 _stdin_thread = threading.Thread(target=_stdin_watcher, daemon=True)
 _stdin_thread.start()
 SEED = 42
-CONTEXT_LEN = 64  # era 64 — muito curto para aprender dependências de frase/parágrafo
+CONTEXT_LEN = 4096 # era 64 → 128 → 512 — contexto maior treinado via Colab, bs=1 compensado pela agregação federada
 PRETRAIN_STEPS = 3000
 PRETRAIN_LR = 0.0006  # era 0.003 — alto demais pra ~14M params, arriscava instabilidade
+MOE_AUX_LOSS_COEF = 0.01  # peso da load-balancing loss (Switch Transformer) — evita
+                          # colapso de roteamento (poucos experts recebendo quase
+                          # todo o tráfego de tokens) sem competir com a loss principal
 PRETRAIN_LR_CONT = 0.0003  # era 0.0008
 REINFORCE_LR = 0.0005
 SUPERVISED_LR = 0.0005  # era 0.001
@@ -85,7 +88,7 @@ CSV_MIN_LEN_MEDIO_TEXTO = 15
 
 # LIMITE MÁXIMO DE ARQUIVOS E CARACTERES (NOVO - RAILWAY FIX)
 CORPUS_MAX_FILES = 50  # Máximo 50 arquivos
-CORPUS_MAX_CHARS_TOTAL = 5000000  # 5MB total
+CORPUS_MAX_CHARS_TOTAL = 500000000  # 5MB total
 IGNORE_DIRS = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.env', 'dist', 'build', '.pytest_cache', '.tox', '.idea', '.vscode'}
 
 def _extrair_texto_csv(caminho_completo):
@@ -194,18 +197,226 @@ except NameError:
     diretorio_raiz = os.getcwd()
 # IGNORA /kaggle/input se não existir (NOVO)
 EXTRA_CORPUS_DIRS = ['/kaggle/input'] if os.path.isdir('/kaggle/input') else []
-_CATEGORIAS_CORPUS = {'code': ('.py',), 'general': ('.txt', '.csv')}
+_CATEGORIAS_CORPUS = {'general': ('.txt', '.csv')}
+# 'code': ('.py',) foi removido por enquanto — estava fazendo o próprio
+# app.py/ia_server.py (e qualquer outro .py da pasta) entrarem no corpus
+# de treino junto com os datasets de texto, contaminando o aprendizado de
+# inglês básico com sintaxe/identificadores Python (CONTEXT_LEN, state_dict,
+# console.print, etc. apareciam nas gerações). Reative quando for a hora de
+# focar em código de propósito, e idealmente com um corpus de código
+# dedicado (como o fine_tuning_dataset.csv), não o código-fonte do projeto.
 _corpus_por_categoria = carregar_corpus_categorizado([diretorio_raiz] + EXTRA_CORPUS_DIRS, _CATEGORIAS_CORPUS)
-CORPUS_CODE = _corpus_por_categoria['code']
+CORPUS_CODE = _corpus_por_categoria.get('code', '')  # vazio enquanto 'code' não estiver em _CATEGORIAS_CORPUS
 CORPUS_GENERAL = _corpus_por_categoria['general']
 CORPUS = CORPUS_CODE + '\n' + CORPUS_GENERAL
 EOS = '\x00'
-chars = sorted(set(CORPUS + EOS))
-VOCAB = len(chars)
-c2i = {c: i for i, c in enumerate(chars)}
-i2c = {i: c for i, c in enumerate(chars)}
-encode = lambda s: [c2i[c] for c in s if c in c2i]
-decode = lambda l: ''.join((i2c.get(i, '?') for i in l))
+# ═══════════════════════════════════════════════════════════════════════
+# TOKENIZER — BPE byte-level (substitui o char-level anterior)
+# ═══════════════════════════════════════════════════════════════════════
+# Por que byte-level: a base do vocab são os 256 valores de byte, então
+# QUALQUER texto UTF-8 é representável sem nunca cair num "caractere não
+# visto" — a mesma garantia que o char-level tinha (via i2c.get(i,'?') e o
+# crescimento dinâmico de vocab), só que por construção, sem precisar
+# redimensionar tok_emb/head em tempo real. Cada token passa a cobrir em
+# média ~3-4 bytes de texto real, então CONTEXT_LEN (em tokens) passa a
+# enxergar bem mais contexto do que via char puro — esse é o ganho que
+# motivou a migração.
+BPE_VOCAB_SIZE = int(os.environ.get('BPE_VOCAB_SIZE', 4096))
+# 4096 é um meio-termo pro tier ~14M params (INIT_CONFIG: embed_dim=256):
+# tok_emb + head somados ficam em ~4096*256*2 ≈ 2M params extras (~15% do
+# modelo) — vocab maior comprime mais texto por posição, mas infla essas
+# duas camadas. Se for controlar o tamanho total, mexa aqui (e no cache
+# de tokenizer.json, que precisa ser apagado pra retreinar com vocab novo).
+
+def _bpe_get_pair_counts(ids, alive, nxt):
+    counts = {}
+    pos = {}
+    for i in range(len(ids)):
+        if not alive[i]:
+            continue
+        j = nxt[i]
+        if j == -1:
+            continue
+        p = (ids[i], ids[j])
+        counts[p] = counts.get(p, 0) + 1
+        pos.setdefault(p, set()).add(i)
+    return counts, pos
+
+def _bpe_train(text: str, vocab_size: int) -> dict:
+    """Treina merges de BPE byte-level. Usa lista encadeada (prev/next) +
+    heap de contagens em vez de reescanear o corpus inteiro a cada merge
+    (isso seria O(n * n_merges) — inviável pra corpus de alguns MB; aqui
+    cada merge custa só o tamanho da vizinhança afetada)."""
+    raw = text.encode('utf-8')
+    n = len(raw)
+    if n < 2:
+        return {}
+    ids = list(raw)
+    nxt = list(range(1, n)) + [-1]
+    prv = list(range(-1, n - 1))
+    alive = [True] * n
+    pair_count, pair_pos = _bpe_get_pair_counts(ids, alive, nxt)
+    heap = [(-c, p) for p, c in pair_count.items()]
+    heapq.heapify(heap)
+    merges = {}
+    next_id = 256
+    EOS_BYTE = 0  # nunca funde o byte 0 (EOS) com vizinhos — mantém o EOS
+                  # sempre como token atômico, igual garantia que o char-level
+                  # dava reservando um índice próprio pra ele no vocab
+    while next_id < vocab_size:
+        chosen = None
+        while heap:
+            negc, p = heapq.heappop(heap)
+            if pair_count.get(p, 0) == -negc and -negc >= 2:
+                chosen = p
+                break
+        if chosen is None:
+            break
+        if EOS_BYTE in chosen:
+            pair_count[chosen] = 0
+            continue
+        positions = list(pair_pos.get(chosen, ()))
+        merges[chosen] = next_id
+        for i in positions:
+            if not alive[i]:
+                continue
+            j = nxt[i]
+            if j == -1 or ids[i] != chosen[0] or ids[j] != chosen[1]:
+                continue
+            p_, n_ = (prv[i], nxt[j])
+            if p_ != -1:
+                old = (ids[p_], ids[i])
+                pair_count[old] = pair_count.get(old, 0) - 1
+                pair_pos.get(old, set()).discard(p_)
+            if n_ != -1:
+                old = (ids[j], ids[n_])
+                pair_count[old] = pair_count.get(old, 0) - 1
+                pair_pos.get(old, set()).discard(j)
+            ids[i] = next_id
+            alive[j] = False
+            nxt[i] = n_
+            if n_ != -1:
+                prv[n_] = i
+            if p_ != -1:
+                newp = (ids[p_], ids[i])
+                pair_count[newp] = pair_count.get(newp, 0) + 1
+                pair_pos.setdefault(newp, set()).add(p_)
+                heapq.heappush(heap, (-pair_count[newp], newp))
+            if n_ != -1:
+                newp = (ids[i], ids[n_])
+                pair_count[newp] = pair_count.get(newp, 0) + 1
+                pair_pos.setdefault(newp, set()).add(i)
+                heapq.heappush(heap, (-pair_count[newp], newp))
+        pair_count[chosen] = 0
+        next_id += 1
+    return merges
+
+def _bpe_vocab_from_merges(merges: dict) -> dict:
+    vocab = {i: bytes([i]) for i in range(256)}
+    for (a, b), idx in sorted(merges.items(), key=lambda kv: kv[1]):
+        vocab[idx] = vocab[a] + vocab[b]
+    return vocab
+
+def _bpe_encode(text: str, merges: dict) -> list:
+    """Mesma ideia do _bpe_train: lista encadeada (prev/next) + heap de
+    prioridade, em vez de reconstruir a lista inteira a cada merge aplicado.
+    A versão antiga fazia set(zip(ids, ids[1:])) + reescrever a lista toda
+    por merge — O(n_merges * n), inviável pra texto grande (o CORPUS
+    inteiro, ~200KB, com ~3840 merges). Aqui cada merge custa só a
+    vizinhança afetada, igual no treino: O(n + n_merges_aplicados).
+    Resultado idêntico ao algoritmo original (sempre aplica o merge de
+    menor id/maior prioridade disponível a cada rodada)."""
+    ids = list(text.encode('utf-8'))
+    n = len(ids)
+    if n < 2 or not merges:
+        return ids
+    nxt = list(range(1, n)) + [-1]
+    prv = list(range(-1, n - 1))
+    alive = [True] * n
+    heap = []
+    for i in range(n - 1):
+        pair = (ids[i], ids[i + 1])
+        rank = merges.get(pair)
+        if rank is not None:
+            heapq.heappush(heap, (rank, i))
+    while heap:
+        rank, i = heapq.heappop(heap)
+        if not alive[i]:
+            continue
+        j = nxt[i]
+        if j == -1:
+            continue
+        pair = (ids[i], ids[j])
+        if merges.get(pair) != rank:
+            continue  # posição desatualizada (par mudou desde que foi empilhado)
+        p_, n_ = (prv[i], nxt[j])
+        ids[i] = rank
+        alive[j] = False
+        nxt[i] = n_
+        if n_ != -1:
+            prv[n_] = i
+        # novo par à esquerda (pode ter surgido/mudado prioridade)
+        if p_ != -1:
+            newp = (ids[p_], ids[i])
+            newrank = merges.get(newp)
+            if newrank is not None:
+                heapq.heappush(heap, (newrank, p_))
+        # novo par à direita
+        if n_ != -1:
+            newp = (ids[i], ids[n_])
+            newrank = merges.get(newp)
+            if newrank is not None:
+                heapq.heappush(heap, (newrank, i))
+    out = []
+    i = 0
+    while i != -1:
+        if alive[i]:
+            out.append(ids[i])
+        i = nxt[i]
+    return out
+
+def _bpe_decode(ids: list, vocab: dict) -> str:
+    b = b''.join((vocab.get(i, b'?') for i in ids))
+    return b.decode('utf-8', errors='replace')
+
+def _bpe_merges_to_json(merges: dict) -> list:
+    return [[list(p), i] for p, i in merges.items()]
+
+def _bpe_merges_from_json(data: list) -> dict:
+    return {tuple(p): i for p, i in data}
+
+def _bpe_load_or_train(corpus_text: str, vocab_size: int, cache_path: str):
+    """Tenta carregar merges já treinados do disco antes de retreinar —
+    treinar BPE num corpus de alguns MB não é instantâneo, então cachear
+    evita pagar esse custo a cada restart do processo."""
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                saved = _json.load(f)
+            if saved.get('vocab_size') == vocab_size:
+                merges = _bpe_merges_from_json(saved['merges'])
+                return merges, _bpe_vocab_from_merges(merges)
+        except Exception:
+            pass
+    console.print(f'[bold cyan]🔤 Treinando tokenizer BPE (vocab_size={vocab_size})...[/bold cyan]')
+    merges = _bpe_train(corpus_text, vocab_size)
+    vocab = _bpe_vocab_from_merges(merges)
+    try:
+        os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            _json.dump({'vocab_size': vocab_size, 'merges': _bpe_merges_to_json(merges)}, f)
+    except Exception as e:
+        console.print(f'[yellow]⚠️  Não deu pra salvar cache do tokenizer: {e}[/yellow]')
+    console.print(f'[bold cyan]🔤 Tokenizer BPE pronto: {len(vocab)} tokens ({len(merges)} merges)[/bold cyan]')
+    return merges, vocab
+
+_TOKENIZER_CACHE_PATH = os.path.join(CHECKPOINT_DIR, 'tokenizer.json')
+BPE_MERGES, BPE_VOCAB = _bpe_load_or_train(CORPUS, BPE_VOCAB_SIZE, _TOKENIZER_CACHE_PATH)
+VOCAB = len(BPE_VOCAB)
+encode = lambda s: _bpe_encode(s, BPE_MERGES)
+decode = lambda ids: _bpe_decode(ids, BPE_VOCAB)
+NEWLINE_ID = encode('\n')[0]  # 1 byte só → nunca passa por merge, sempre atômico
+EOS_ID = 0                    # byte 0, protegido de merges em _bpe_train
 data_tensor = torch.tensor(encode(CORPUS), dtype=torch.long)
 if torch.cuda.is_available():
     device = torch.device('cuda')
@@ -262,6 +473,11 @@ class MoELayer(nn.Module):
         self.top_k = min(top_k, n_experts)
         self.router = nn.Linear(embed_dim, n_experts, bias=False)
         self.experts = nn.ModuleList([nn.Sequential(nn.Linear(embed_dim, 4 * embed_dim), nn.GELU(), nn.Linear(4 * embed_dim, embed_dim), nn.Dropout(dropout)) for _ in range(n_experts)])
+        # Load-balancing (estilo Switch Transformer): guarda a loss auxiliar do
+        # último forward pra ser somada na loss principal depois. Sem isso, o
+        # roteador só aprende pelo gradiente da tarefa e pode colapsar num
+        # sub-conjunto de experts, desperdiçando a capacidade dos outros.
+        self.last_aux_loss = None
 
     def forward(self, x: torch.Tensor, forced_expert: int=None) -> torch.Tensor:
         B, T, C = x.shape
@@ -273,6 +489,19 @@ class MoELayer(nn.Module):
         router_probs = F.softmax(router_logits, dim=-1)
         topk_probs, topk_idx = router_probs.topk(self.top_k, dim=-1)
         topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-09)
+
+        # --- load-balancing loss (Switch Transformer, eq. 4-5) ---
+        # f_i = fração de tokens roteados pro expert i (contagem "dura", via top-1)
+        # P_i = probabilidade média que o roteador deu ao expert i (soft, com grad)
+        # aux_loss = n_experts * sum(f_i * P_i) -> mínimo quando distribuição é uniforme
+        n_tok = x_flat.shape[0]
+        top1_idx = topk_idx[:, 0]
+        f_i = torch.zeros(self.n_experts, device=x.device, dtype=router_probs.dtype)
+        f_i.scatter_add_(0, top1_idx, torch.ones(n_tok, device=x.device, dtype=router_probs.dtype))
+        f_i = f_i / max(n_tok, 1)
+        P_i = router_probs.mean(dim=0)
+        self.last_aux_loss = self.n_experts * (f_i * P_i).sum()
+
         output = torch.zeros_like(x_flat)
         for expert_id, expert in enumerate(self.experts):
             is_selected = topk_idx == expert_id
@@ -351,7 +580,16 @@ class TinyAI(nn.Module):
                 new_kvs.append(nkv)
         x = self.ln_f(x)
         logits = self.head(x)
-        loss = F.cross_entropy(logits.view(-1, VOCAB), targets.view(-1)) if targets is not None else None
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, VOCAB), targets.view(-1))
+            # soma a loss de load-balancing de cada camada MoE (se houver).
+            # Coeficiente pequeno (0.01, igual ao paper do Switch Transformer)
+            # pra não competir com a loss principal de predição de token.
+            aux_losses = [b.mlp.last_aux_loss for b in self.blocks
+                          if isinstance(b.mlp, MoELayer) and b.mlp.last_aux_loss is not None]
+            if aux_losses:
+                loss = loss + MOE_AUX_LOSS_COEF * torch.stack(aux_losses).mean()
         return (logits, loss, new_kvs)
 
     @property
@@ -380,6 +618,10 @@ FED_JOB_TTL_SECONDS = 1800          # jobs emitidos e nunca respondidos expiram
 FED_MAX_PENDING_JOBS = 500          # limite de jobs "em aberto" guardados em memória
 
 _fed_lock = threading.Lock()
+_VOCAB_EPOCH = 0  # incrementado toda vez que o vocab muda — sinaliza pra quem tem
+                  # um optimizer vivo que ele precisa ser reconstruído (senão fica
+                  # segurando referência aos tensores antigos de tok_emb/head pra
+                  # sempre, vazando memória a cada expansão)
 _fed_state = {
     'version': 0,
     'jobs': {},            # job_id -> {'version', 'issued_at', 'worker_id_hint'}
@@ -443,7 +685,7 @@ def _fed_issue_job(model: 'TinyAI', own_content: bool) -> dict:
         'version': version,
         'model_cfg': model._cfg,
         'model_code': _get_model_source(),
-        'vocab_chars': chars,
+        'bpe_merges': _bpe_merges_to_json(BPE_MERGES),
         'context_len': CONTEXT_LEN,
         'weights': weights_b64,
         'max_steps': FED_MAX_STEPS_PER_JOB,
@@ -531,7 +773,7 @@ def _ckpt_path(filename: str) -> str:
 
 def save_checkpoint(model: TinyAI, rl_opt, sup_opt, state: dict, filename: str=CHECKPOINT_LAST, pretrain_opt=None) -> None:
     path = _ckpt_path(filename)
-    payload = {'model_cfg': model._cfg, 'model_state': model.state_dict(), 'vocab_chars': chars, 'vocab_size': VOCAB, 'rl_opt_state': rl_opt.state_dict(), 'sup_opt_state': sup_opt.state_dict(), 'pretrain_opt_state': pretrain_opt.state_dict() if pretrain_opt is not None else None, 'gen': state['gen'], 'temp': state['temp'], 'best_reward': state['best_reward'], 'best_code': state['best_code'], 'best_gen': state['best_gen'], 'config': state['config'], 'mutation_log': state['mutation_log'], 'reward_hist': list(state['reward_hist']), 'temp_resets': state['temp_resets'], 'stdout_memory': list(state.get('stdout_memory', [])), 'stdout_norm_mem': list(state.get('stdout_norm_memory', []))}
+    payload = {'model_cfg': model._cfg, 'model_state': model.state_dict(), 'bpe_merges': _bpe_merges_to_json(BPE_MERGES), 'vocab_size': VOCAB, 'context_len': CONTEXT_LEN, 'rl_opt_state': rl_opt.state_dict(), 'sup_opt_state': sup_opt.state_dict(), 'pretrain_opt_state': pretrain_opt.state_dict() if pretrain_opt is not None else None, 'gen': state['gen'], 'temp': state['temp'], 'best_reward': state['best_reward'], 'best_code': state['best_code'], 'best_gen': state['best_gen'], 'config': state['config'], 'mutation_log': state['mutation_log'], 'reward_hist': list(state['reward_hist']), 'temp_resets': state['temp_resets'], 'stdout_memory': list(state.get('stdout_memory', [])), 'stdout_norm_mem': list(state.get('stdout_norm_memory', []))}
     torch.save(payload, path)
 
 def load_checkpoint(filename: str=CHECKPOINT_LAST):
@@ -576,7 +818,7 @@ def save_premium_checkpoint(model: 'TinyAI', rl_opt, sup_opt, pretrain_opt, stat
     seq = len(existing) + 1
     filename = f'skill_{seq:03d}_r{r_val:.2f}_gen{gen}_{slug}.pt'
     path = os.path.join(PREMIUM_DIR, filename)
-    payload = {'model_cfg': model._cfg, 'model_state': model.state_dict(), 'vocab_chars': chars, 'vocab_size': VOCAB, 'rl_opt_state': rl_opt.state_dict(), 'sup_opt_state': sup_opt.state_dict(), 'pretrain_opt_state': pretrain_opt.state_dict() if pretrain_opt else None, 'skill_code': code, 'skill_stdout': stdout, 'skill_reward': r_val, 'skill_gen': gen, 'skill_complexity': factor, 'gen': state['gen'], 'temp': state['temp'], 'best_reward': state['best_reward'], 'best_code': state['best_code'], 'best_gen': state['best_gen'], 'config': state['config'], 'mutation_log': state['mutation_log'], 'reward_hist': list(state['reward_hist']), 'temp_resets': state['temp_resets'], 'stdout_memory': list(state.get('stdout_memory', [])), 'stdout_norm_mem': list(state.get('stdout_norm_memory', []))}
+    payload = {'model_cfg': model._cfg, 'model_state': model.state_dict(), 'bpe_merges': _bpe_merges_to_json(BPE_MERGES), 'vocab_size': VOCAB, 'context_len': CONTEXT_LEN, 'rl_opt_state': rl_opt.state_dict(), 'sup_opt_state': sup_opt.state_dict(), 'pretrain_opt_state': pretrain_opt.state_dict() if pretrain_opt else None, 'skill_code': code, 'skill_stdout': stdout, 'skill_reward': r_val, 'skill_gen': gen, 'skill_complexity': factor, 'gen': state['gen'], 'temp': state['temp'], 'best_reward': state['best_reward'], 'best_code': state['best_code'], 'best_gen': state['best_gen'], 'config': state['config'], 'mutation_log': state['mutation_log'], 'reward_hist': list(state['reward_hist']), 'temp_resets': state['temp_resets'], 'stdout_memory': list(state.get('stdout_memory', [])), 'stdout_norm_mem': list(state.get('stdout_norm_memory', []))}
     torch.save(payload, path)
     return True
 
@@ -604,11 +846,15 @@ def _init_premium_stdout_set() -> set:
             pass
     return seen
 
-def _transplant_state_dict(saved_sd: dict, model: 'TinyAI') -> None:
+def _transplant_state_dict(saved_sd: dict, model: 'TinyAI', skip_prefixes: tuple = ()) -> None:
     dst_sd = model.state_dict()
     for key in dst_sd:
         if key not in saved_sd:
             continue
+        if any(key.startswith(p) for p in skip_prefixes):
+            continue  # ex: tok_emb./head. quando o esquema de vocab mudou —
+                       # transplantar essas linhas seria misturar índices de
+                       # tokenizers diferentes, pior que reiniciar do zero
         s, d = (saved_sd[key], dst_sd[key])
         if s.shape == d.shape:
             dst_sd[key] = s.clone()
@@ -618,12 +864,55 @@ def _transplant_state_dict(saved_sd: dict, model: 'TinyAI') -> None:
     model.load_state_dict(dst_sd)
 
 def restore_from_checkpoint(ckpt: dict, state: dict):
+    global BPE_MERGES, BPE_VOCAB, VOCAB, data_tensor
+    legacy_char_ckpt = 'bpe_merges' not in ckpt and 'vocab_chars' in ckpt
+    if 'bpe_merges' in ckpt:
+        # Reconstrói o tokenizer EXATO usado quando esse checkpoint foi
+        # salvo, em vez de confiar no que foi treinado nessa sessão a partir
+        # do corpus local. Isso corrige uma fragilidade que o char-level
+        # tinha: o vocab char-level era recriado do zero a cada restart a
+        # partir dos arquivos presentes naquele momento, então dois deploys
+        # com corpus ligeiramente diferente (Railway vs Kaggle vs Termux)
+        # podiam silenciosamente indexar os mesmos caracteres de jeitos
+        # diferentes. Aqui o tokenizer vira parte do checkpoint, não do
+        # ambiente.
+        ckpt_merges = _bpe_merges_from_json(ckpt['bpe_merges'])
+        BPE_MERGES = ckpt_merges
+        BPE_VOCAB = _bpe_vocab_from_merges(ckpt_merges)
+        VOCAB = len(BPE_VOCAB)
+        data_tensor = torch.tensor(encode(CORPUS), dtype=torch.long)
+        try:
+            with open(_TOKENIZER_CACHE_PATH, 'w', encoding='utf-8') as f:
+                _json.dump({'vocab_size': VOCAB, 'merges': _bpe_merges_to_json(BPE_MERGES)}, f)
+        except Exception:
+            pass
     model = TinyAI(ckpt['model_cfg']).to(device)
     ckpt_vocab = ckpt['model_state']['tok_emb.weight'].shape[0]
-    vocab_mismatch = ckpt_vocab != VOCAB
-    if vocab_mismatch:
-        delta = VOCAB - ckpt_vocab
-        console.print(f'[bold yellow]⚠️  Vocab mudou: checkpoint={ckpt_vocab} chars  atual={VOCAB} chars  ({delta:+d})[/bold yellow]\n   → Transplantando pesos compatíveis; {abs(delta)} token(s) {('novo(s)' if delta > 0 else 'removido(s)')} ficam com init aleatório.\n   → Pré-treino de recuperação será executado automaticamente.')
+    # checkpoints salvos antes desse campo existir não têm 'context_len' —
+    # nesse caso deduzimos do shape do pos_emb salvo.
+    ckpt_context_len = ckpt.get('context_len', ckpt['model_state']['pos_emb.weight'].shape[0])
+    vocab_changed = ckpt_vocab != VOCAB
+    context_changed = ckpt_context_len != CONTEXT_LEN
+    vocab_mismatch = vocab_changed or context_changed
+    if legacy_char_ckpt:
+        console.print('[bold yellow]⚠️  Checkpoint salvo com o tokenizer char-level antigo — migrando pra BPE.\n'
+                       '   → tok_emb/head não são reaproveitáveis entre os dois esquemas de vocab '
+                       '(reiniciados do zero, com init aleatório).\n'
+                       '   → attention/MLP/MoE (a "estrutura" do modelo) são transplantados normalmente.\n'
+                       '   → Pré-treino de recuperação será executado automaticamente.[/bold yellow]')
+        _transplant_state_dict(ckpt['model_state'], model, skip_prefixes=('tok_emb.', 'head.'))
+        rl_opt = torch.optim.AdamW(model.parameters(), lr=REINFORCE_LR)
+        sup_opt = torch.optim.AdamW(model.parameters(), lr=SUPERVISED_LR)
+        pretrain_opt = torch.optim.AdamW(model.parameters(), lr=PRETRAIN_LR, weight_decay=0.0001)
+        vocab_mismatch = True
+    elif vocab_mismatch:
+        avisos = []
+        if vocab_changed:
+            d = VOCAB - ckpt_vocab
+            avisos.append(f"vocab: checkpoint={ckpt_vocab} tokens, atual={VOCAB} tokens ({d:+d})")
+        if context_changed:
+            avisos.append(f"context_len: checkpoint={ckpt_context_len}, atual={CONTEXT_LEN}")
+        console.print('[bold yellow]⚠️  ' + ' | '.join(avisos) + '[/bold yellow]\n   → Transplantando pesos compatíveis (posições/tokens novos ficam com init aleatório).\n   → Pré-treino de recuperação será executado automaticamente.')
         _transplant_state_dict(ckpt['model_state'], model)
         rl_opt = torch.optim.AdamW(model.parameters(), lr=REINFORCE_LR)
         sup_opt = torch.optim.AdamW(model.parameters(), lr=SUPERVISED_LR)
@@ -659,8 +948,8 @@ def generate_rl(model, temperature=0.9, on_char=None):
     model.train()
     log_probs = []
     entropies = []
-    chars_so_far = []
-    tok = torch.tensor([[c2i.get('\n', 0)]], dtype=torch.long, device=device)
+    ids_so_far = []
+    tok = torch.tensor([[NEWLINE_ID]], dtype=torch.long, device=device)
     past_kv = None
     for _ in range(MAX_CODE_LEN):
         logits, _, past_kv = model(tok, past_kv=past_kv, use_cache=True)
@@ -672,15 +961,17 @@ def generate_rl(model, temperature=0.9, on_char=None):
         ent = -(probs * (probs + 1e-08).log()).sum()
         log_probs.append(lp)
         entropies.append(ent)
-        ch = i2c.get(sampled.item(), '?')
-        chars_so_far.append(ch)
+        tid = sampled.item()
+        ids_so_far.append(tid)
+        # decodifica o acumulado inteiro (não o token isolado): um token BPE
+        # pode ser só metade de um caractere UTF-8 multi-byte
+        full = decode(ids_so_far)
         if on_char:
-            on_char(''.join(chars_so_far))
-        full = ''.join(chars_so_far)
-        if EOS in full or full.count('\n') >= 2:
+            on_char(full)
+        if tid == EOS_ID or full.count('\n') >= 2:
             break
         tok = sampled.unsqueeze(0)
-    code = ''.join(chars_so_far).strip().replace(EOS, '')
+    code = decode(ids_so_far).strip().replace(EOS, '')
     lp_t = torch.stack(log_probs) if log_probs else None
     ent_t = torch.stack(entropies) if entropies else None
     return (code, lp_t, ent_t)
@@ -749,7 +1040,12 @@ def reward(rc, stdout, stderr, code: str='') -> float:
         return round(1.0 * max(factor, 0.5), 3)
     return round(min(0.7 * factor, 0.98), 3)
 
-def get_batch(bs=1):  # era 4 — muito pequeno pra ~14M params, gradiente ruidoso demais
+def get_batch(bs=4):  # era 1 — bs=1 só adicionava ruído de gradiente à toa (um único
+                       # exemplo decidindo o step inteiro). bs=4 já reduz bastante a
+                       # variância. Não subiu mais que isso porque a atenção aqui é
+                       # "ingênua" (sem Flash Attention) e escala O(T²) por camada:
+                       # com CONTEXT_LEN=4096, cada unidade de batch custa vários GB
+                       # de ativações de atenção. Suba com cautela e monitore RAM/VRAM.
     max_i = len(data_tensor) - CONTEXT_LEN - 1
     if max_i <= 0:
         return (None, None)
@@ -778,7 +1074,7 @@ def pretrain(model, steps, lr, status_callback=None, opt=None):
             status_callback(step, steps, loss.item())
     return model
 
-def _get_batch_de_texto(texto_encoded: torch.Tensor, bs=2):  # era 16, testando com carga menor
+def _get_batch_de_texto(texto_encoded: torch.Tensor, bs=1):  # era 16 → 2 → 1, consistente com o treino federado (bs=1)
     max_i = len(texto_encoded) - CONTEXT_LEN - 1
     if max_i <= 0:
         return (None, None)
@@ -1062,7 +1358,7 @@ def rodar_treino_expert_cli(expert_id: int, categoria: str, steps: int=None):
 def main():
     console.print('\n[bold blue]══ 🧬 SELF-EVOLVING AI v4  (MoE + Checkpoints + Premium Skills) ══[/bold blue]')
     console.print(f'   {dev_str}')
-    console.print(f'   vocab={VOCAB} chars  |  context={CONTEXT_LEN}  |  corpus={len(data_tensor)} tokens\n')
+    console.print(f'   vocab={VOCAB} tokens (BPE)  |  context={CONTEXT_LEN}  |  corpus={len(data_tensor)} tokens\n')
     state = novo_estado_inicial()
     premium_stdout_set = _init_premium_stdout_set()
     if premium_stdout_set:
@@ -1344,28 +1640,45 @@ def main():
     console.print(f'   Checkpoints em: [bold]{os.path.abspath(CHECKPOINT_DIR)}[/bold]')
     console.print(f'   Habilidades premium: [bold magenta]{state['premium_count']}[/bold magenta] salvas em: [bold]{os.path.abspath(PREMIUM_DIR)}[/bold]\n')
     console.print('[bold green]🧬 A IA evoluiu. Até a próxima![/bold green]\n')
+def _truncate_kv_cache(past_kv, max_len: int):
+    """Corta o cache K/V pra caber no teto de CONTEXT_LEN — sem isso, uma
+    geração longa o suficiente estoura o índice do pos_emb (que só tem
+    CONTEXT_LEN posições) e quebra com erro de shape."""
+    if past_kv is None:
+        return None
+    out = []
+    for k, v in past_kv:
+        if k.shape[2] > max_len:
+            k = k[:, :, -max_len:, :].contiguous()
+            v = v[:, :, -max_len:, :].contiguous()
+        out.append((k, v))
+    return out
+
+
 @torch.no_grad()
 def generate_text(model, prompt: str, max_new: int=200, temperature: float=0.8) -> str:
     model.eval()
     tokens = encode(prompt)
     if not tokens:
-        tokens = [c2i.get('\n', 0)]
-    tok = torch.tensor([tokens[-CONTEXT_LEN:]], dtype=torch.long, device=device)
-    out_chars = []
+        tokens = [NEWLINE_ID]
+    # deixa 1 posição de folga pro próximo token gerado não estourar CONTEXT_LEN
+    tok = torch.tensor([tokens[-(CONTEXT_LEN - 1):]], dtype=torch.long, device=device)
+    out_ids = []
     logits, _, past_kv = model(tok, use_cache=True)
     next_logits = logits[:, -1, :] / max(temperature, 0.1)
     for _ in range(max_new):
         probs = F.softmax(next_logits, dim=-1)
         sampled = torch.distributions.Categorical(probs).sample()
-        ch = i2c.get(sampled.item(), '?')
-        if ch == EOS:
+        tid = sampled.item()
+        if tid == EOS_ID:
             break
-        out_chars.append(ch)
+        out_ids.append(tid)
         tok = sampled.view(1, 1)
+        past_kv = _truncate_kv_cache(past_kv, CONTEXT_LEN - 1)
         logits, _, past_kv = model(tok, past_kv=past_kv, use_cache=True)
         next_logits = logits[:, -1, :] / max(temperature, 0.1)
     model.train()
-    return ''.join(out_chars)
+    return decode(out_ids)
 
 
 _WIKI_STOP_SECTIONS = {
@@ -1413,9 +1726,43 @@ _wiki_cache_lock = threading.Lock()
 _wiki_cache: list = []       # fila de (title, texto) já buscados, prontos pra usar
 _WIKI_CACHE_TARGET = 5        # quantas páginas manter prontas no buffer
 _WIKI_MODE = False            # setado por run_server(wiki=True)
+WIKI_CORPUS_DIR = './wiki_corpus'  # cada página vira um .txt aqui — substrato pra RAG/replay no chat.py
 
 
-def _wiki_prefetch_loop():
+def _slug(title: str) -> str:
+    safe = ''.join(c if c.isalnum() or c in ' -_' else '_' for c in title).strip()
+    return (safe or 'pagina')[:120]
+
+
+def _save_wiki_page_to_disk(title: str, texto: str):
+    """Persiste a página em disco — sem isso, o conteúdo buscado só existe
+    na RAM do servidor e some a cada restart/redeploy. Um arquivo por página
+    (nome = título) pra dar pra inspecionar/filtrar manualmente depois, e
+    pro chat.py usar como pool de replay (--wiki-corpus-dir)."""
+    try:
+        os.makedirs(WIKI_CORPUS_DIR, exist_ok=True)
+        path = os.path.join(WIKI_CORPUS_DIR, _slug(title) + '.txt')
+        if not os.path.exists(path):  # não reescreve se já tem (evita duplicar I/O em páginas repetidas)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(texto)
+    except OSError as e:
+        console.print(f'[bold yellow]⚠️  Não consegui salvar a página em disco: {e}[/bold yellow]')
+
+
+def _expand_vocab_with_text(model: 'TinyAI', texto: str) -> bool:
+    """No char-level antigo, essa função crescia o vocab (chars/VOCAB/c2i/i2c)
+    toda vez que a Wikipedia trazia um caractere nunca visto, redimensionando
+    tok_emb/head em memória. Com BPE byte-level isso deixou de ser
+    necessário: os 256 bytes-base já cobrem qualquer texto UTF-8 por
+    construção, então não existe mais "caractere fora do vocab". Mantida
+    como no-op só pra não quebrar quem chama (_wiki_prefetch_loop). Se um dia
+    fizer sentido retreinar os merges do BPE periodicamente com texto novo,
+    é aqui que essa lógica entraria — mas isso implica reconstruir
+    tok_emb/head do zero (o índice de cada token muda), não redimensionar."""
+    return False
+
+
+def _wiki_prefetch_loop(model: 'TinyAI'):
     console.print('[bold cyan]📖 Prefetch de conteúdo da Wikipedia iniciado (--federated --wiki)[/bold cyan]')
     while True:
         with _wiki_cache_lock:
@@ -1431,6 +1778,8 @@ def _wiki_prefetch_loop():
             continue
         if len(texto) <= CONTEXT_LEN + 1:
             continue
+        _expand_vocab_with_text(model, texto)
+        _save_wiki_page_to_disk(title, texto)
         with _wiki_cache_lock:
             _wiki_cache.append((title, texto))
         console.print(f"[cyan]📖 Wiki em cache: '{title}' ({len(texto)} chars) — buffer: {len(_wiki_cache)}/{_WIKI_CACHE_TARGET}[/cyan]")
@@ -1505,7 +1854,71 @@ def _build_flask_app(model, rl_opt, sup_opt, pretrain_opt, state, federated: boo
     return app
 
 
-def run_server(wiki: bool=False, host: str='0.0.0.0', port: int=5000, federated: bool=False):
+def _sample_batch_local(encoded: torch.Tensor, context_len: int, dev):
+    if len(encoded) <= context_len + 1:
+        return None, None
+    i = torch.randint(0, len(encoded) - context_len - 1, (1,)).item()
+    x = encoded[i:i + context_len].unsqueeze(0).to(dev)
+    y = encoded[i + 1:i + context_len + 1].unsqueeze(0).to(dev)
+    return x, y
+
+
+def _local_training_direct(model: 'TinyAI', pretrain_opt, rl_opt, sup_opt, state: dict,
+                            loss_target: float = 0.7, max_steps_por_pagina: int = 2000):
+    """Treino local DIRETO no modelo mestre — sem cópia extra, sem
+    compressão de pesos (isso é o que pesava em RAM no modo via job
+    federado, que existe pra simular um voluntário de verdade isolado).
+    Consome as páginas do mesmo buffer de prefetch que o --wiki alimenta."""
+    console.print("[bold green]💻 Treino local direto iniciado (--training-local, sem federação/duplicação de modelo)[/bold green]")
+    local_vocab_epoch = _VOCAB_EPOCH
+    while True:
+        with _wiki_cache_lock:
+            pagina = _wiki_cache.pop(0) if _wiki_cache else None
+        if pagina is None:
+            time.sleep(1)
+            continue
+        title, texto = pagina
+        encoded = torch.tensor(encode(texto), dtype=torch.long)
+        if len(encoded) <= CONTEXT_LEN + 1:
+            continue
+        console.print(f"[cyan]💻 Treinando local: '{title}' ({len(texto)} chars)[/cyan]")
+        step = 0
+        last_loss = None
+        while step < max_steps_por_pagina:
+            if _VOCAB_EPOCH != local_vocab_epoch:
+                # vocab mudou (tok_emb/head foram trocados) — o optimizer antigo
+                # ainda referencia os tensores órfãos; reconstruir evita vazar
+                # memória a cada expansão E garante que os pesos novos recebam
+                # atualização de verdade (senão ficam congelados pra sempre)
+                with _server_lock:
+                    pretrain_opt = torch.optim.AdamW(model.parameters(), lr=PRETRAIN_LR, weight_decay=0.0001)
+                    rl_opt = torch.optim.AdamW(model.parameters(), lr=REINFORCE_LR)
+                    sup_opt = torch.optim.AdamW(model.parameters(), lr=SUPERVISED_LR)
+                    local_vocab_epoch = _VOCAB_EPOCH
+                console.print("[cyan]🔄 Vocab mudou — optimizer reconstruído (evita vazamento de memória)[/cyan]")
+            x, y = _sample_batch_local(encoded, CONTEXT_LEN, device)
+            if x is None:
+                break
+            with _server_lock:
+                _, loss, _ = model(x, y)
+                pretrain_opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                pretrain_opt.step()
+            last_loss = loss.item()
+            step += 1
+            if step == 1 or step % 5 == 0:
+                console.print(f'   step {step}  loss={last_loss:.4f}')
+            if last_loss <= loss_target:
+                break
+        with _server_lock:
+            state['gen'] = state.get('gen', 0) + 1
+            save_checkpoint(model, rl_opt, sup_opt, state, CHECKPOINT_LAST, pretrain_opt=pretrain_opt)
+        motivo = 'atingiu loss alvo' if last_loss is not None and last_loss <= loss_target else 'limite de steps'
+        console.print(f"[bold green]✅ '{title}' concluída ({motivo}) — loss final={last_loss:.4f}, {step} steps. Checkpoint salvo.[/bold green]")
+
+
+def run_server(wiki: bool=False, host: str='0.0.0.0', port: int=5000, federated: bool=False, training_local: bool=False):
     global _WIKI_MODE
     if Flask is None:
         console.print('[bold red]❌ Flask não instalado. Rode: pip install flask[/bold red]')
@@ -1515,14 +1928,28 @@ def run_server(wiki: bool=False, host: str='0.0.0.0', port: int=5000, federated:
     model, rl_opt, sup_opt, pretrain_opt = _carregar_ou_criar_modelo(state)
     if wiki:
         _WIKI_MODE = True
-        t = threading.Thread(target=_wiki_prefetch_loop, daemon=True)
+        t = threading.Thread(target=_wiki_prefetch_loop, args=(model,), daemon=True)
         t.start()
+    if training_local:
+        if not wiki:
+            console.print('[bold yellow]⚠️  --training-local consome páginas do buffer da Wikipedia — ligando --wiki automaticamente.[/bold yellow]')
+            _WIKI_MODE = True
+            t = threading.Thread(target=_wiki_prefetch_loop, args=(model,), daemon=True)
+            t.start()
+        # deixa pelo menos 1 núcleo de folga pro Flask não ficar starved
+        try:
+            torch.set_num_threads(max(1, (os.cpu_count() or 4) - 1))
+        except Exception:
+            pass
+        t2 = threading.Thread(target=_local_training_direct, args=(model, pretrain_opt, rl_opt, sup_opt, state), daemon=True)
+        t2.start()
     app = _build_flask_app(model, rl_opt, sup_opt, pretrain_opt, state, federated=federated)
     rotas = 'GET /v1/model, POST /v1/chat, GET /v1/status'
     if federated:
         rotas += ', GET /v1/job, POST /v1/submit'
     fonte = 'Wikipedia (prefetch)' if wiki else 'corpus local'
-    console.print(f'[bold green]🚀 Servidor em http://{host}:{port}  ({rotas})  — conteúdo dos jobs: {fonte}[/bold green]\n')
+    extra = ' + treino local direto ligado' if training_local else ''
+    console.print(f'[bold green]🚀 Servidor em http://{host}:{port}  ({rotas})  — conteúdo dos jobs: {fonte}{extra}[/bold green]\n')
     app.run(host=host, port=port, threaded=True)
 
 
@@ -1534,7 +1961,7 @@ if __name__ == '__main__':
                 _port = int(sys.argv[sys.argv.index('--port') + 1])
             except (ValueError, IndexError):
                 pass
-        run_server(wiki='--wiki' in sys.argv, port=_port, federated='--federated' in sys.argv)
+        run_server(wiki='--wiki' in sys.argv, port=_port, federated='--federated' in sys.argv, training_local='--training-local' in sys.argv)
     else:
         _cli = _parse_expert_cli(sys.argv)
         if _cli is not None:
