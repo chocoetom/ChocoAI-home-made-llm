@@ -1,15 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import subprocess, sys, time, random, math, os, threading, queue, select, csv
-import io, gzip, base64, inspect, uuid, heapq, json as _json
+import sys, time, random, math, os, threading, csv, signal
+import io, gzip, base64, inspect, uuid, heapq, re as _re, json as _json
 from collections import deque
-from rich.live import Live
-from rich.panel import Panel
-from rich.columns import Columns
-from rich.text import Text
-from rich.console import Console, Group
-from rich import box
+from rich.console import Console
 try:
     import requests
 except ImportError:
@@ -20,23 +15,16 @@ except ImportError:
     Flask = None
 console = Console()
 _server_lock = threading.RLock()  # RLock: precisa ser reentrante (algumas funções federadas se chamam em cadeia já segurando o lock)
-_cmd_queue: 'queue.Queue[str]' = queue.Queue()
-
-def _stdin_watcher():
-    while True:
-        try:
-            r, _, _ = select.select([sys.stdin], [], [], 1.0)
-            if r:
-                line = sys.stdin.readline().strip()
-                if line:
-                    _cmd_queue.put(line)
-        except Exception:
-            break
-_stdin_thread = threading.Thread(target=_stdin_watcher, daemon=True)
-_stdin_thread.start()
 SEED = 42
-CONTEXT_LEN = 4096 # era 64 → 128 → 512 — contexto maior treinado via Colab, bs=1 compensado pela agregação federada
-PRETRAIN_STEPS = 3000
+CONTEXT_LEN = 1024 # era 64 → 128 → 512 — contexto maior treinado via Colab, bs=1 compensado pela agregação federada
+PRETRAIN_STEPS = 50000  # teto de segurança — o treino normalmente para antes, por loss (abaixo)
+# --- parada por loss (hardcoded) — calibrado pra ~100-200MB de texto, modelo ~15M params, BPE 4096 ---
+# Loss de um batch (bs=4) é ruidosa, então tudo é medido na média móvel das últimas LOSS_WINDOW steps.
+LOSS_WINDOW = 200            # janela da média móvel
+LOSS_MIN_STEPS = 1000        # nunca para antes disso (evita parar num vale falso no começo)
+LOSS_TARGET = 3.3            # para se a média móvel chegar aqui (estimativa do piso pra esse tamanho de modelo/vocab)
+LOSS_PLATEAU_PATIENCE = 2000 # para se a média móvel não melhorar por essa quantidade de steps...
+LOSS_PLATEAU_MIN_DELTA = 0.01  # ...onde "melhorar" = cair pelo menos isso em relação ao melhor já visto
 PRETRAIN_LR = 0.0006  # era 0.003 — alto demais pra ~14M params, arriscava instabilidade
 MOE_AUX_LOSS_COEF = 0.01  # peso da load-balancing loss (Switch Transformer) — evita
                           # colapso de roteamento (poucos experts recebendo quase
@@ -44,20 +32,18 @@ MOE_AUX_LOSS_COEF = 0.01  # peso da load-balancing loss (Switch Transformer) —
 PRETRAIN_LR_CONT = 0.0003  # era 0.0008
 REINFORCE_LR = 0.0005
 SUPERVISED_LR = 0.0005  # era 0.001
-MAX_CODE_LEN = 64
-CODE_TIMEOUT = 3
-MUTATION_EVERY = 300
-MUTATION_TRIALS = 3
-MUTATION_STEPS = 80
-REWARD_WINDOW = 30
+# --- treino local por página (--training-local) ---
+# Antes: loss_target=1.8, max_steps_por_pagina=2000 — perseguir um loss tão
+# baixo numa única página, reamostrando só ela por até 2000 passos, decora o
+# texto em vez de generalizar (catastrophic forgetting das páginas
+# anteriores). Meta mais frouxa + menos passos + replay buffer abaixo
+# resolvem isso.
+LOCAL_TRAIN_LOSS_TARGET = 2.5       # era 1.8
+LOCAL_TRAIN_MAX_STEPS_POR_PAGINA = 300  # era 2000
+REPLAY_BUFFER_MAX_PAGES = 30         # quantas páginas recentes ficam disponíveis pra replay
+REPLAY_BATCH_SIZE = 4                # tamanho do batch por step de treino local (era 1)
+REPLAY_FRACTION = 0.5                # fração do batch vinda de páginas antigas (resto = página atual)
 TEMP_START = 1.1
-TEMP_MIN = 0.6
-TEMP_DECAY = 0.9997
-ENTROPY_COEF = 0.03
-ENTROPY_STUCK_THRESHOLD = 2.4
-ENTROPY_STUCK_REWARD = 0.25
-ENTROPY_STUCK_PATIENCE = 30
-ENTROPY_STUCK_PT_STEPS = 3000
 _KAGGLE_WORKING = '/kaggle/working'
 if os.path.isdir(_KAGGLE_WORKING):
     CHECKPOINT_DIR = os.path.join(_KAGGLE_WORKING, 'checkpoints')
@@ -65,21 +51,11 @@ else:
     CHECKPOINT_DIR = './checkpoints'
 CHECKPOINT_EVERY = 50
 CHECKPOINT_LAST = 'checkpoint_last.pt'
-CHECKPOINT_BEST = 'checkpoint_best.pt'
-PREMIUM_DIR = os.path.join(CHECKPOINT_DIR, 'premium')
-PREMIUM_MIN_REWARD = 0.8
-PREMIUM_MIN_FACTOR = 0.6
-PREMIUM_MAX_SKILLS = 100
 INIT_CONFIG = dict(embed_dim=256, n_heads=8, n_layers=6, dropout=0.1, use_moe=True, n_experts=4, top_k=1)
 # Tier 1 (~14M params totais, ~poucos M ativos por token já que top_k=1).
 # Tier 2 (~43M): embed_dim=384, n_heads=8,  n_layers=8,  n_experts=4, top_k=1, CONTEXT_LEN=320
 # Tier 3 (~95M): embed_dim=512, n_heads=8,  n_layers=10, n_experts=4, top_k=1, CONTEXT_LEN=384
-LEARN_SUP_STEPS = 400
-LEARN_RL_TRIES = 300
-LEARN_REPS_NEEDED = 40
-LEARN_TEMP_START = 1.0
 EXPAND_EMBED_DELTA = 16
-MAX_CODE_LEN_LEARN = 120
 torch.manual_seed(SEED)
 random.seed(SEED)
 CSV_MAX_CHARS_POR_ARQUIVO = 2000000
@@ -783,69 +759,6 @@ def load_checkpoint(filename: str=CHECKPOINT_LAST):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     return ckpt
 
-def _premium_slug(stdout: str, code: str) -> str:
-    import re as _re2
-    slug = stdout.strip()[:40]
-    slug = _re2.sub('[^a-zA-Z0-9 ]', '', slug)
-    slug = slug.strip().lower()
-    slug = _re2.sub('\\s+', '_', slug)
-    slug = slug[:30] or 'skill'
-    return slug
-
-def save_premium_checkpoint(model: 'TinyAI', rl_opt, sup_opt, pretrain_opt, state: dict, code: str, stdout: str, r_val: float, gen: int, *, premium_stdout_set: set) -> bool:
-    import re as _re2
-    if r_val < PREMIUM_MIN_REWARD:
-        return False
-    factor = _code_complexity_factor(code)
-    if factor < PREMIUM_MIN_FACTOR:
-        return False
-
-    def _norm(s: str) -> str:
-        s = s.lower().strip()
-        s = _re2.sub('\\s+', ' ', s)
-        s = _re2.sub('[^a-z0-9 ]', '', s)
-        s = _re2.sub('(.)\\1{2,}', '\\1', s)
-        return s.strip()
-    norm_out = _norm(stdout) if stdout else ''
-    if norm_out in premium_stdout_set:
-        return False
-    os.makedirs(PREMIUM_DIR, exist_ok=True)
-    existing = [f for f in os.listdir(PREMIUM_DIR) if f.endswith('.pt')]
-    if len(existing) >= PREMIUM_MAX_SKILLS:
-        return False
-    premium_stdout_set.add(norm_out)
-    slug = _premium_slug(stdout, code)
-    seq = len(existing) + 1
-    filename = f'skill_{seq:03d}_r{r_val:.2f}_gen{gen}_{slug}.pt'
-    path = os.path.join(PREMIUM_DIR, filename)
-    payload = {'model_cfg': model._cfg, 'model_state': model.state_dict(), 'bpe_merges': _bpe_merges_to_json(BPE_MERGES), 'vocab_size': VOCAB, 'context_len': CONTEXT_LEN, 'rl_opt_state': rl_opt.state_dict(), 'sup_opt_state': sup_opt.state_dict(), 'pretrain_opt_state': pretrain_opt.state_dict() if pretrain_opt else None, 'skill_code': code, 'skill_stdout': stdout, 'skill_reward': r_val, 'skill_gen': gen, 'skill_complexity': factor, 'gen': state['gen'], 'temp': state['temp'], 'best_reward': state['best_reward'], 'best_code': state['best_code'], 'best_gen': state['best_gen'], 'config': state['config'], 'mutation_log': state['mutation_log'], 'reward_hist': list(state['reward_hist']), 'temp_resets': state['temp_resets'], 'stdout_memory': list(state.get('stdout_memory', [])), 'stdout_norm_mem': list(state.get('stdout_norm_memory', []))}
-    torch.save(payload, path)
-    return True
-
-def _init_premium_stdout_set() -> set:
-    import re as _re2
-
-    def _norm(s: str) -> str:
-        s = s.lower().strip()
-        s = _re2.sub('\\s+', ' ', s)
-        s = _re2.sub('[^a-z0-9 ]', '', s)
-        s = _re2.sub('(.)\\1{2,}', '\\1', s)
-        return s.strip()
-    seen = set()
-    if not os.path.isdir(PREMIUM_DIR):
-        return seen
-    for fname in os.listdir(PREMIUM_DIR):
-        if not fname.endswith('.pt'):
-            continue
-        try:
-            ckpt = torch.load(os.path.join(PREMIUM_DIR, fname), map_location='cpu', weights_only=False)
-            out = ckpt.get('skill_stdout', '')
-            if out:
-                seen.add(_norm(out))
-        except Exception:
-            pass
-    return seen
-
 def _transplant_state_dict(saved_sd: dict, model: 'TinyAI', skip_prefixes: tuple = ()) -> None:
     dst_sd = model.state_dict()
     for key in dst_sd:
@@ -944,102 +857,6 @@ def restore_from_checkpoint(ckpt: dict, state: dict):
     state['n_params'] = model.n_params
     return (model, rl_opt, sup_opt, pretrain_opt, vocab_mismatch)
 
-def generate_rl(model, temperature=0.9, on_char=None):
-    model.train()
-    log_probs = []
-    entropies = []
-    ids_so_far = []
-    tok = torch.tensor([[NEWLINE_ID]], dtype=torch.long, device=device)
-    past_kv = None
-    for _ in range(MAX_CODE_LEN):
-        logits, _, past_kv = model(tok, past_kv=past_kv, use_cache=True)
-        logits = logits[:, -1, :] / max(temperature, 0.1)
-        probs = F.softmax(logits, dim=-1)
-        dist = torch.distributions.Categorical(probs)
-        sampled = dist.sample()
-        lp = dist.log_prob(sampled)
-        ent = -(probs * (probs + 1e-08).log()).sum()
-        log_probs.append(lp)
-        entropies.append(ent)
-        tid = sampled.item()
-        ids_so_far.append(tid)
-        # decodifica o acumulado inteiro (não o token isolado): um token BPE
-        # pode ser só metade de um caractere UTF-8 multi-byte
-        full = decode(ids_so_far)
-        if on_char:
-            on_char(full)
-        if tid == EOS_ID or full.count('\n') >= 2:
-            break
-        tok = sampled.unsqueeze(0)
-    code = decode(ids_so_far).strip().replace(EOS, '')
-    lp_t = torch.stack(log_probs) if log_probs else None
-    ent_t = torch.stack(entropies) if entropies else None
-    return (code, lp_t, ent_t)
-
-def safe_exec(code: str):
-    if not code.strip():
-        return (-3, '', 'código vazio')
-    try:
-        r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=CODE_TIMEOUT)
-        return (r.returncode, r.stdout.strip()[:200], r.stderr.strip()[:200])
-    except subprocess.TimeoutExpired:
-        return (-1, '', 'TIMEOUT')
-    except Exception as e:
-        return (-2, '', str(e)[:100])
-import re as _re
-
-def _is_only_comments(code: str) -> bool:
-    for line in code.split('\n'):
-        stripped = line.strip()
-        if stripped and (not stripped.startswith('#')):
-            return False
-    return True
-_COMPLEXITY_KW = ['for ', 'while ', 'if ', 'elif ', 'else:', 'def ', 'class ', 'import ', 'from ', 'return ', 'yield ', 'range(', 'len(', 'sum(', 'list(', 'dict(', 'set(', 'map(', 'lambda ', 'try:', 'except ', 'with ', 'open(', 'math.', 'random.']
-_TRIVIAL_PRINT_RE = _re.compile('^print\\s*\\(\\s*(?:["\\\'][^"\\\']*["\\\']|\\d+)\\s*\\)$')
-_SIMPLE_ASSIGN_RE = _re.compile('^[a-zA-Z_][a-zA-Z0-9_]*\\s*=\\s*.+$')
-_REAL_FLOW_KW = ['for ', 'while ', 'if ', 'elif ', 'else:', 'def ', 'class ', 'return ', 'yield ', 'range(', 'len(', 'sum(', 'list(', 'dict(', 'set(', 'map(', 'try:', 'except ', 'with ', 'open(', 'math.', 'random.']
-_WEAK_KW = ['import ', 'from ', 'lambda ']
-
-def _code_complexity_factor(code: str) -> float:
-    lines = [l.strip() for l in code.split('\n') if l.strip() and (not l.strip().startswith('#'))]
-    if not lines:
-        return 0.02
-    has_real_flow = any((kw in code for kw in _REAL_FLOW_KW))
-    has_weak_kw = any((kw in code for kw in _WEAK_KW))
-    print_lines = [l for l in lines if l.startswith('print')]
-    non_print_lines = [l for l in lines if not l.startswith('print')]
-    if has_real_flow:
-        return 1.4
-    if has_weak_kw and (not print_lines):
-        return 0.8
-    if print_lines and (not non_print_lines):
-        return 0.15
-    if not print_lines and all((_SIMPLE_ASSIGN_RE.match(l) for l in lines)):
-        return 0.1
-    if print_lines and non_print_lines:
-        return 0.5
-    return 0.8
-
-def reward(rc, stdout, stderr, code: str='') -> float:
-    if rc in (-1, -3):
-        return 0.0
-    if code and _is_only_comments(code):
-        return 0.01
-    if rc != 0:
-        factor = _code_complexity_factor(code) if code else 1.0
-        base = 0.05 if 'SyntaxError' in stderr else 0.2
-        return round(min(base * factor, base), 3)
-    factor = _code_complexity_factor(code) if code else 1.0
-    if not stdout:
-        return round(min(0.12 * factor, 0.2), 3)
-    sl = stdout.lower().strip()
-    canonical = {'hi', 'hello', 'hey', 'hi there', 'hello world', 'hey there'}
-    if sl in canonical:
-        return 2.0
-    if any((w in sl for w in ('hi', 'hello', 'hey'))):
-        return round(1.0 * max(factor, 0.5), 3)
-    return round(min(0.7 * factor, 0.98), 3)
-
 def get_batch(bs=4):  # era 1 — bs=1 só adicionava ruído de gradiente à toa (um único
                        # exemplo decidindo o step inteiro). bs=4 já reduz bastante a
                        # variância. Não subiu mais que isso porque a atenção aqui é
@@ -1070,8 +887,8 @@ def pretrain(model, steps, lr, status_callback=None, opt=None):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        if status_callback:
-            status_callback(step, steps, loss.item())
+        if status_callback and status_callback(step, steps, loss.item()):
+            break  # callback pediu parada (ex: critério de loss)
     return model
 
 def _get_batch_de_texto(texto_encoded: torch.Tensor, bs=1):  # era 16 → 2 → 1, consistente com o treino federado (bs=1)
@@ -1134,162 +951,10 @@ def treinar_expert(model, expert_id: int, texto: str, steps: int, lr: float, sta
             set_expert_treinavel(model, expert_id, apenas_este=False)
     return model
 
-def reinforce_update(model, optimizer, log_probs, entropies, r_val, baseline):
-    if log_probs is None or entropies is None or len(log_probs) == 0:
-        return (0.0, 0.0)
-    advantage = r_val - baseline
-    policy_loss = -log_probs.sum() * advantage
-    entropy_bonus = -ENTROPY_COEF * entropies.mean()
-    loss = policy_loss + entropy_bonus
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
-    return (loss.item(), entropies.mean().item())
-
-def supervised_on_success(model, optimizer, code, steps=20):
-    toks = encode(code + '\n')
-    if len(toks) < 4:
-        return
-    t = torch.tensor(toks, dtype=torch.long, device=device)
-    for _ in range(steps):
-        x = t[:-1].unsqueeze(0)
-        y = t[1:].unsqueeze(0)
-        if x.shape[1] < 1:
-            break
-        _, loss, _ = model(x, y)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-        optimizer.step()
-
-def transplant_weights(src: TinyAI, dst: TinyAI) -> None:
-    src_sd = src.state_dict()
-    dst_sd = dst.state_dict()
-    for key in dst_sd:
-        if key not in src_sd:
-            continue
-        s, d = (src_sd[key], dst_sd[key])
-        if s.shape == d.shape:
-            dst_sd[key] = s.clone()
-        else:
-            slices = tuple((slice(0, min(a, b)) for a, b in zip(s.shape, d.shape)))
-            dst_sd[key][slices] = s[slices].clone()
-    dst.load_state_dict(dst_sd)
-
-def mutate_config(cfg: dict) -> dict:
-    new = cfg.copy()
-    kind = random.choice(['embed', 'layers', 'heads', 'dropout', 'experts'])
-    if kind == 'embed':
-        new['embed_dim'] = max(32, cfg['embed_dim'] + random.choice([-16, 16, 32]))
-        new['embed_dim'] = new['embed_dim'] // new['n_heads'] * new['n_heads']
-    elif kind == 'layers':
-        new['n_layers'] = max(1, min(8, cfg['n_layers'] + random.choice([-1, 1])))
-    elif kind == 'heads':
-        new['n_heads'] = random.choice([2, 4, 8])
-        new['embed_dim'] = max(new['n_heads'] * 8, new['embed_dim'])
-        new['embed_dim'] = new['embed_dim'] // new['n_heads'] * new['n_heads']
-    elif kind == 'dropout':
-        new['dropout'] = round(max(0.0, min(0.4, cfg['dropout'] + random.choice([-0.05, 0.05]))), 2)
-    elif kind == 'experts' and cfg.get('use_moe'):
-        choices = [e for e in [2, 4, 8] if e != cfg.get('n_experts', 4)]
-        new['n_experts'] = random.choice(choices)
-        new['top_k'] = min(new['n_experts'] - 1, cfg.get('top_k', 2))
-    return new
-
-def _eval_model_loss(model, n_batches=20):
-    losses = []
-    with torch.no_grad():
-        for _ in range(n_batches):
-            x, y = get_batch(16)
-            if x is None:
-                break
-            _, l, _ = model(x, y)
-            losses.append(l.item())
-    return sum(losses) / max(1, len(losses))
-
-def eval_config(cfg: dict):
-    m = TinyAI(cfg).to(device)
-    pretrain(m, MUTATION_STEPS, PRETRAIN_LR)
-    return (m, _eval_model_loss(m))
-
-def eval_mutation_from_model(base_model: TinyAI, cfg: dict, steps: int=MUTATION_STEPS):
-    m = TinyAI(cfg).to(device)
-    transplant_weights(base_model, m)
-    pretrain(m, steps, PRETRAIN_LR)
-    return (m, _eval_model_loss(m))
-REWARD_COLORS = {0.0: 'red', 0.05: 'red', 0.2: 'orange3', 0.5: 'yellow', 0.7: 'green', 1.0: 'bright_green', 2.0: 'bold magenta'}
-
-def reward_color(r_val):
-    for thresh in sorted(REWARD_COLORS.keys(), reverse=True):
-        if r_val >= thresh:
-            return REWARD_COLORS[thresh]
-    return 'white'
-
-def sparkline(values, width=28):
-    BLOCKS = '▁▂▃▄▅▆▇█'
-    if not values:
-        return '─' * width
-    mx = max(values) or 1
-    return ''.join((BLOCKS[min(7, int(v / mx * 7))] for v in list(values)[-width:]))
-
-def make_display(st):
-    cfg = st['config']
-    hist = st['reward_hist']
-    avg_r = sum(list(hist)[-20:]) / max(1, min(20, len(hist)))
-    phase_lbl = '[bold cyan]PRÉ-TREINO[/]' if st['phase'] == 'pretrain' else '[bold green]EVOLUINDO[/]'
-    div = st.get('diversity', 1.0)
-    div_color = 'bright_green' if div >= 0.5 else 'yellow' if div >= 0.3 else 'bold red blink'
-    div_str = f'[{div_color}]{div:.0%}[/]'
-    ent = st.get('last_entropy', 0.0)
-    ent_color = 'bright_green' if ent > 2.0 else 'yellow' if ent > 1.0 else 'bold red'
-    stuck = st.get('entropy_stuck_count', 0)
-    stuck_str = f'  │  [bold red blink]🆘 EntStuck:{stuck}/{ENTROPY_STUCK_PATIENCE}[/]' if stuck > ENTROPY_STUCK_PATIENCE // 2 else ''
-    ckpt_str = f'💾 ckpt@gen{st.get('last_ckpt_gen', '—')}' if st.get('last_ckpt_gen') else '💾 sem ckpt'
-    header = Panel(f'{phase_lbl}  │  Gen: [bold]{st['gen']}[/]  │  Melhor: [bold {reward_color(st['best_reward'])}]{st['best_reward']:.2f}[/]  │  Avg(20): [bold]{avg_r:.2f}[/]  │  Div: {div_str}  │  Entropia: [{ent_color}]{ent:.2f}[/]  │  Temp: {st['temp']:.3f}  │  Resets: {st.get('temp_resets', 0)}  │  {ckpt_str}  │  [dim]⌨️  P [+steps]=pré-treino  E id arq [+steps]=treino expert[/dim]  │  {dev_str}{stuck_str}', style='bold blue', box=box.HEAVY)
-    code_str = st['current_code'] or '[dim]aguardando...[/dim]'
-    code_text = Text(code_str, style='bold green')
-    if st['phase'] == 'generate':
-        code_text.append('█', style='blink bright_green')
-    code_panel = Panel(code_text, title='[bold green]🖊️  GERANDO CÓDIGO (ao vivo)[/]', border_style='green', box=box.ROUNDED)
-    rc, stdout, stderr = st.get('last_exec', (None, '', ''))
-    if rc is None:
-        exec_body = '[dim]nenhuma execução ainda[/dim]'
-    elif rc == 0:
-        exec_body = f'[bold green]✅ returncode: 0[/]\nstdout: [bright_white]{repr(stdout[:60])}[/]\nstderr: [dim]—[/dim]'
-    else:
-        tag = {-1: 'TIMEOUT ⏱', -3: 'VAZIO'}.get(rc, f'ERRO (rc={rc})')
-        exec_body = f'[bold red]❌ {tag}[/]\nstdout: [dim]{repr(stdout[:40])}[/]\nstderr: [yellow]{stderr[:80]}[/yellow]'
-    last_r = st.get('last_reward', 0.0)
-    exec_panel = Panel(exec_body + f'\n[bold]reward: [{reward_color(last_r)}]{last_r:.2f}[/][/bold]', title='[bold yellow]⚡ EXECUÇÃO[/]', border_style='yellow', box=box.ROUNDED)
-    best_body = f'[bold cyan]{st['best_code'] or 'nenhum ainda...'}[/]\nreward: [bold {reward_color(st['best_reward'])}]{st['best_reward']:.2f}[/]  │  na geração {st['best_gen']}'
-    best_panel = Panel(best_body, title='[bold cyan]🏆 MELHOR RESULTADO[/]', border_style='cyan', box=box.ROUNDED)
-    spark = sparkline(list(hist))
-    recent = list(hist)[-10:]
-    dist_str = ' '.join((f'[{reward_color(r)}]{r:.1f}[/]' for r in recent))
-    hist_panel = Panel(f'[bold]{spark}[/]\n{dist_str}', title='[bold magenta]📊 HISTÓRICO DE REWARDS[/]', border_style='magenta', box=box.ROUNDED)
-    gens_to_mut = MUTATION_EVERY - st['gen'] % MUTATION_EVERY
-    mut_log = '  │  '.join(st['mutation_log'][-3:]) if st['mutation_log'] else '—'
-    moe_info = ''
-    if cfg.get('use_moe'):
-        moe_info = f'  │  [bold]MoE[/]: experts={cfg.get('n_experts', 4)} top-k={cfg.get('top_k', 2)}'
-    arch_panel = Panel(f'embed={cfg['embed_dim']}  layers={cfg['n_layers']}  heads={cfg['n_heads']}  dropout={cfg['dropout']}{moe_info}  │  params={st['n_params']:,}  │  próxima mutação em: [bold]{gens_to_mut}[/] gens\nhist: {mut_log}', title='[bold blue]🧬 ARQUITETURA (MoE + auto-evolução)[/]', border_style='blue', box=box.ROUNDED)
-    log_lines = '\n'.join(st['log'][-5:]) or '[dim]...[/dim]'
-    log_panel = Panel(log_lines, title='[dim]📝 LOG[/dim]', border_style='dim', box=box.SIMPLE)
-    return Group(header, Columns([code_panel, exec_panel], equal=True), Columns([best_panel, hist_panel], equal=True), arch_panel, log_panel)
-
-def make_throttled_updater(live, state, min_interval: float=0.1):
-    _last = [0.0]
-
-    def update(force: bool=False):
-        now = time.monotonic()
-        if force or now - _last[0] >= min_interval:
-            live.update(make_display(state))
-            _last[0] = now
-    return update
-
 def novo_estado_inicial():
-    return dict(phase='pretrain', gen=0, temp=TEMP_START, config=INIT_CONFIG.copy(), n_params=0, current_code='', last_exec=(None, '', ''), last_reward=0.0, best_code='', best_reward=0.0, best_gen=0, reward_hist=deque(maxlen=REWARD_WINDOW * 3), mutation_log=[], log=[], code_memory=set(), stdout_memory=set(), stdout_norm_memory=set(), recent_codes=deque(maxlen=30), diversity=0.0, last_entropy=0.0, temp_resets=0, last_ckpt_gen=None, entropy_stuck_count=0, premium_count=0)
+    # Campos mantidos por compatibilidade com o formato dos checkpoints
+    # (save_checkpoint / restore_from_checkpoint) e com o servidor Flask.
+    return dict(gen=0, temp=TEMP_START, config=INIT_CONFIG.copy(), n_params=0, best_code='', best_reward=0.0, best_gen=0, reward_hist=deque(maxlen=90), mutation_log=[], stdout_memory=set(), stdout_norm_memory=set(), temp_resets=0)
 
 def _carregar_ou_criar_modelo(state):
     ckpt = load_checkpoint(CHECKPOINT_LAST)
@@ -1353,34 +1018,25 @@ def rodar_treino_expert_cli(expert_id: int, categoria: str, steps: int=None):
         return
     save_checkpoint(model, rl_opt, sup_opt, state, CHECKPOINT_LAST, pretrain_opt=pretrain_opt)
     console.print(f'\n[bold green]✅ Expert {expert_id} ({categoria}) treinado por {steps} steps. Checkpoint salvo em {os.path.abspath(_ckpt_path(CHECKPOINT_LAST))}[/bold green]\n')
-    console.print("[dim]Rode 'python ia.py' sem argumentos pra voltar ao loop normal de auto-evolução com esse expert já treinado.[/dim]\n")
+    console.print("[dim]Rode 'python ia_server.py' sem argumentos pra continuar o treino geral.[/dim]\n")
 
 def main():
-    console.print('\n[bold blue]══ 🧬 SELF-EVOLVING AI v4  (MoE + Checkpoints + Premium Skills) ══[/bold blue]')
+    """Rotina de `python ia_server.py`: treina, salva o checkpoint e encerra."""
+    console.print('\n[bold blue]══ 🧬 SELF-EVOLVING AI — Treino (MoE + Checkpoints) ══[/bold blue]')
     console.print(f'   {dev_str}')
     console.print(f'   vocab={VOCAB} tokens (BPE)  |  context={CONTEXT_LEN}  |  corpus={len(data_tensor)} tokens\n')
+    if len(data_tensor) <= CONTEXT_LEN + 1:
+        console.print('[bold red]❌ Corpus curto demais pra treinar (coloque arquivos .txt/.csv na pasta).[/bold red]\n')
+        return
     state = novo_estado_inicial()
-    premium_stdout_set = _init_premium_stdout_set()
-    if premium_stdout_set:
-        console.print(f"[bold magenta]🌟 Premium: {len(premium_stdout_set)} habilidade(s) já salva(s) em '{PREMIUM_DIR}'[/bold magenta]")
-
-    def log(msg):
-        state['log'].append(msg)
     ckpt = load_checkpoint(CHECKPOINT_LAST)
     if ckpt is not None:
         console.print('[bold yellow]♻️  Checkpoint encontrado! Retomando treino...[/bold yellow]')
         model, rl_opt, sup_opt, pretrain_opt, vocab_mismatch = restore_from_checkpoint(ckpt, state)
-        state['last_ckpt_gen'] = state['gen']
-        log(f'♻️  Retomado do checkpoint: gen={state['gen']}  best_reward={state['best_reward']:.2f}')
-        skip_pretrain = not vocab_mismatch
         if vocab_mismatch:
-            log(f'⚠️  Vocab mudou → pré-treino de recuperação agendado')
+            steps, lr, label = 2500, PRETRAIN_LR, 'recuperação'
         else:
-            avg_hist = sum(ckpt.get('reward_hist', [0])[-20:]) / max(1, min(20, len(ckpt.get('reward_hist', [0]))))
-            if avg_hist < ENTROPY_STUCK_REWARD:
-                skip_pretrain = False
-                vocab_mismatch = True
-                log(f'⚠️  Sessão anterior com avg_reward={avg_hist:.2f} < {ENTROPY_STUCK_REWARD} → pré-treino de re-ancoragem agendado')
+            steps, lr, label = PRETRAIN_STEPS, PRETRAIN_LR_CONT, 'continuação'
     else:
         console.print('[bold green]🆕 Nenhum checkpoint encontrado. Começando do zero.[/bold green]')
         model = TinyAI(INIT_CONFIG).to(device)
@@ -1388,258 +1044,51 @@ def main():
         rl_opt = torch.optim.AdamW(model.parameters(), lr=REINFORCE_LR)
         sup_opt = torch.optim.AdamW(model.parameters(), lr=SUPERVISED_LR)
         pretrain_opt = torch.optim.AdamW(model.parameters(), lr=PRETRAIN_LR, weight_decay=0.0001)
-        skip_pretrain = False
-        vocab_mismatch = False
-        log(f'Modelo MoE criado: {model.n_params:,} params  (experts={INIT_CONFIG['n_experts']} top-k={INIT_CONFIG['top_k']})')
-    with Live(make_display(state), refresh_per_second=10, screen=False) as live:
-        refresh = make_throttled_updater(live, state, min_interval=0.1)
-        if not skip_pretrain:
-            state['phase'] = 'pretrain'
-            pt_steps = 2500 if vocab_mismatch else PRETRAIN_STEPS
-            pt_label = 'recuperação' if vocab_mismatch else 'inicial'
-            log(f'Iniciando pré-treino de {pt_label} ({pt_steps} steps)...')
-            refresh(force=True)
+        steps, lr, label = PRETRAIN_STEPS, PRETRAIN_LR, 'inicial'
+    console.print(f'[bold cyan]🏋️  Treino {label}: {steps} steps  |  lr={lr}  |  params={model.n_params:,}[/bold cyan]\n')
+    progresso = {'step': 0, 'loss': None, 'avg': None, 'motivo': 'limite de steps'}
+    janela = deque(maxlen=LOSS_WINDOW)
+    melhor = {'avg': float('inf'), 'step': 0}
 
-            def pretrain_cb(step, total, loss):
-                state['current_code'] = f'[pré-treino {pt_label}] step {step}/{total}  loss={loss:.4f}'
-                refresh()
-                if step > 0 and step % 50 == 0:
-                    save_checkpoint(model, rl_opt, sup_opt, state, CHECKPOINT_LAST, pretrain_opt=pretrain_opt)
-            pretrain(model, pt_steps, PRETRAIN_LR, pretrain_cb, opt=pretrain_opt)
-            log(f'✅ Pré-treino de {pt_label} concluído. Iniciando auto-evolução...')
-        state['phase'] = 'evolve'
-        state['current_code'] = ''
-        refresh(force=True)
-        time.sleep(0.3)
-        try:
-            while True:
-                state['gen'] += 1
-                gen = state['gen']
-                state['phase'] = 'generate'
-
-                def on_char(s):
-                    state['current_code'] = s
-                    refresh()
-                code, log_probs, entropies = generate_rl(model, temperature=state['temp'], on_char=on_char)
-                state['current_code'] = code
-                state['phase'] = 'exec'
-                refresh(force=True)
-                rc, stdout, stderr = safe_exec(code)
-                r_val = reward(rc, stdout, stderr, code)
-                state['last_exec'] = (rc, stdout, stderr)
-                state['last_reward'] = r_val
-                state['reward_hist'].append(r_val)
-                code_hash = hash(code)
-                is_duplicate = code_hash in state['code_memory']
-                state['code_memory'].add(code_hash)
-                state['recent_codes'].append(code)
-                unique_recent = len(set(state['recent_codes']))
-                state['diversity'] = unique_recent / max(1, len(state['recent_codes']))
-
-                def _normalize_stdout(s: str) -> str:
-                    s = s.lower().strip()
-                    s = _re.sub('\\s+', ' ', s)
-                    s = _re.sub('[^a-z0-9 ]', '', s)
-                    s = _re.sub('(.)\\1{2,}', '\\1', s)
-                    for seg_len in range(len(s) // 2, 1, -1):
-                        seg = s[:seg_len]
-                        if s == seg * (len(s) // seg_len) and len(s) % seg_len == 0:
-                            s = seg
-                            break
-                    return s.strip()
-                stdout_key = stdout.strip() if stdout else ''
-                stdout_norm_key = _normalize_stdout(stdout_key) if stdout_key else ''
-                stdout_is_new = stdout_key == '' or (stdout_key not in state['stdout_memory'] and stdout_norm_key not in state['stdout_norm_memory'])
-                if stdout_key and rc == 0:
-                    state['stdout_memory'].add(stdout_key)
-                    if stdout_norm_key:
-                        state['stdout_norm_memory'].add(stdout_norm_key)
-                if is_duplicate:
-                    rl_reward = 0.0
-                    log(f'⚠️  Gen {gen}: duplicata exata — update ignorado')
-                elif not stdout_is_new and r_val >= 0.5:
-                    rl_reward = 0.0
-                    log(f'⚠️  Gen {gen}: stdout repetido ({repr(stdout_key[:25])}) — sem reward RL')
-                else:
-                    rl_reward = r_val
-                if r_val >= state['best_reward'] or not state['best_code']:
-                    state['best_reward'] = r_val
-                    state['best_code'] = code
-                    state['best_gen'] = gen
-                    log(f'🏆 Gen {gen}: novo recorde! reward={r_val:.2f}  →  {repr(code[:50])}')
-                    save_checkpoint(model, rl_opt, sup_opt, state, CHECKPOINT_BEST, pretrain_opt=pretrain_opt)
-                    log(f'💾 Best checkpoint salvo (gen {gen})')
-                if rc == 0 and stdout and stdout_is_new:
-                    saved = save_premium_checkpoint(model, rl_opt, sup_opt, pretrain_opt, state, code, stdout, r_val, gen, premium_stdout_set=premium_stdout_set)
-                    if saved:
-                        state['premium_count'] += 1
-                        log(f'🌟 Gen {gen}: habilidade premium salva! reward={r_val:.2f}  stdout={repr(stdout[:30])}  total={state['premium_count']}')
-                baseline = sum(list(state['reward_hist'])[-20:]) / max(1, min(20, len(state['reward_hist'])))
-                if not is_duplicate:
-                    _, ent_val = reinforce_update(model, rl_opt, log_probs, entropies, rl_reward, baseline)
-                    if entropies is not None:
-                        state['last_entropy'] = ent_val
-                elif entropies is not None:
-                    state['last_entropy'] = entropies.mean().item()
-                if rc == 0 and stdout and (r_val >= 0.5) and (not is_duplicate) and stdout_is_new:
-                    supervised_on_success(model, sup_opt, code, steps=15)
-                    if r_val >= 1.0:
-                        log(f'✨ Gen {gen}: funcionou! reward={r_val:.2f}  stdout={repr(stdout[:30])}')
-                state['temp'] = max(TEMP_MIN, state['temp'] * TEMP_DECAY)
-                if len(state['recent_codes']) >= 15 and state['diversity'] < 0.3 and (gen % 10 == 0):
-                    old_temp = state['temp']
-                    state['temp'] = min(TEMP_START, state['temp'] * 3.0)
-                    state['temp_resets'] += 1
-                    log(f'🔄 Gen {gen}: diversidade={state['diversity']:.0%} → temp reset {old_temp:.3f}→{state['temp']:.3f}')
-                cur_avg = sum(list(state['reward_hist'])[-20:]) / max(1, min(20, len(state['reward_hist'])))
-                if state['last_entropy'] >= ENTROPY_STUCK_THRESHOLD and cur_avg < ENTROPY_STUCK_REWARD:
-                    state['entropy_stuck_count'] += 1
-                else:
-                    state['entropy_stuck_count'] = 0
-                if state['entropy_stuck_count'] >= ENTROPY_STUCK_PATIENCE:
-                    state['entropy_stuck_count'] = 0
-                    log(f'🆘 Gen {gen}: entropia={state['last_entropy']:.2f} travada  avg={cur_avg:.2f} por {ENTROPY_STUCK_PATIENCE} gens → pré-treino automático de re-ancoragem ({ENTROPY_STUCK_PT_STEPS} steps)!')
-                    state['phase'] = 'pretrain'
-                    state['current_code'] = f'[re-ancoragem automática] 0/{ENTROPY_STUCK_PT_STEPS}'
-                    refresh(force=True)
-
-                    def _auto_pt_cb(step, total, loss):
-                        state['current_code'] = f'[re-ancoragem automática] step {step}/{total}  loss={loss:.4f}'
-                        refresh()
-                        if step > 0 and step % 50 == 0:
-                            save_checkpoint(model, rl_opt, sup_opt, state, CHECKPOINT_LAST, pretrain_opt=pretrain_opt)
-                    pretrain(model, ENTROPY_STUCK_PT_STEPS, PRETRAIN_LR_CONT, _auto_pt_cb, opt=pretrain_opt)
-                    state['temp'] = TEMP_START
-                    state['phase'] = 'evolve'
-                    state['current_code'] = ''
-                    log(f'✅ Re-ancoragem concluída. Temp resetada para {TEMP_START}')
-                    refresh(force=True)
-                if gen % CHECKPOINT_EVERY == 0:
-                    save_checkpoint(model, rl_opt, sup_opt, state, CHECKPOINT_LAST, pretrain_opt=pretrain_opt)
-                    state['last_ckpt_gen'] = gen
-                    log(f'💾 Checkpoint salvo (gen {gen})')
-                if gen > 0 and gen % MUTATION_EVERY == 0:
-                    state['phase'] = 'mutation'
-                    log(f'🧬 Gen {gen}: avaliando mutações...')
-                    refresh(force=True)
-                    current_cfg = state['config']
-                    ref_loss = _eval_model_loss(model)
-                    best_mut_loss = ref_loss
-                    best_mut_cfg = None
-                    best_mut_m = None
-                    for t in range(MUTATION_TRIALS):
-                        mut_cfg = mutate_config(current_cfg)
-                        state['current_code'] = f'[mutação {t + 1}/{MUTATION_TRIALS}] embed={mut_cfg['embed_dim']} layers={mut_cfg['n_layers']} heads={mut_cfg['n_heads']}' + (f' experts={mut_cfg.get('n_experts')}' if mut_cfg.get('use_moe') else '')
-                        refresh()
-                        try:
-                            mut_m, mut_loss = eval_mutation_from_model(model, mut_cfg)
-                        except Exception as e:
-                            log(f'⚠️  Mutação {t + 1}/{MUTATION_TRIALS} falhou: {type(e).__name__}: {e}')
-                            continue
-                        if mut_loss < best_mut_loss:
-                            best_mut_loss = mut_loss
-                            best_mut_cfg = mut_cfg
-                            best_mut_m = mut_m
-                    if best_mut_cfg is not None:
-                        model = best_mut_m
-                        state['config'] = best_mut_cfg
-                        state['n_params'] = model.n_params
-                        rl_opt = torch.optim.AdamW(model.parameters(), lr=REINFORCE_LR)
-                        sup_opt = torch.optim.AdamW(model.parameters(), lr=SUPERVISED_LR)
-                        pretrain_opt = torch.optim.AdamW(model.parameters(), lr=PRETRAIN_LR, weight_decay=0.0001)
-                        desc = f'embed={best_mut_cfg['embed_dim']} L={best_mut_cfg['n_layers']} H={best_mut_cfg['n_heads']}' + (f' E={best_mut_cfg.get('n_experts')}' if best_mut_cfg.get('use_moe') else '')
-                        state['mutation_log'].append(f'✅ {desc} (gen {gen})')
-                        log(f'🧬 Mutação aceita! {desc}  loss {ref_loss:.4f}→{best_mut_loss:.4f}')
-                        save_checkpoint(model, rl_opt, sup_opt, state, CHECKPOINT_LAST, pretrain_opt=pretrain_opt)
-                        state['last_ckpt_gen'] = gen
-                        log(f'💾 Checkpoint pós-mutação salvo')
-                    else:
-                        state['mutation_log'].append(f'❌ manteve (gen {gen})')
-                        log(f'🧬 Sem melhora na mutação (ref_loss={ref_loss:.4f})')
-                    state['phase'] = 'evolve'
-                    state['current_code'] = ''
-                try:
-                    cmd = _cmd_queue.get_nowait()
-                    parts_raw = cmd.strip().split()
-                    parts = cmd.strip().upper().split()
-                    if parts and parts[0] == 'P':
-                        pt_steps = PRETRAIN_STEPS
-                        if len(parts) > 1:
-                            try:
-                                pt_steps = int(parts[1])
-                            except ValueError:
-                                pass
-                        log(f'⌨️  Pré-treino manual solicitado ({pt_steps} steps)...')
-                        state['phase'] = 'pretrain'
-                        state['current_code'] = f'[pré-treino manual] 0/{pt_steps}'
-                        refresh()
-
-                        def _manual_cb(step, total, loss):
-                            state['current_code'] = f'[pré-treino manual] step {step}/{total}  loss={loss:.4f}'
-                            refresh()
-                            if step > 0 and step % 50 == 0:
-                                save_checkpoint(model, rl_opt, sup_opt, state, CHECKPOINT_LAST, pretrain_opt=pretrain_opt)
-                        pretrain(model, pt_steps, PRETRAIN_LR_CONT, _manual_cb, opt=pretrain_opt)
-                        state['phase'] = 'evolve'
-                        state['current_code'] = ''
-                        log(f'✅ Pré-treino manual concluído ({pt_steps} steps)')
-                        refresh()
-                    elif parts and parts[0] == 'E':
-                        if len(parts_raw) < 3:
-                            log('⌨️  Uso: E <expert_id> <arquivo> [steps]  (ex: E 0 ./dados/python.txt 800)')
-                        else:
-                            try:
-                                exp_id = int(parts_raw[1])
-                            except ValueError:
-                                log(f'⌨️  expert_id inválido: {parts_raw[1]!r}')
-                                exp_id = None
-                            caminho_txt = parts_raw[2] if exp_id is not None else None
-                            e_steps = LEARN_SUP_STEPS
-                            if exp_id is not None and len(parts_raw) > 3:
-                                try:
-                                    e_steps = int(parts_raw[3])
-                                except ValueError:
-                                    pass
-                            if exp_id is not None:
-                                if not os.path.isfile(caminho_txt):
-                                    log(f'⌨️  Arquivo não encontrado: {caminho_txt}')
-                                else:
-                                    with open(caminho_txt, 'r', encoding='utf-8', errors='ignore') as f:
-                                        texto_expert = f.read()
-                                    log(f"⌨️  Treinando expert {exp_id} com '{caminho_txt}' ({len(texto_expert)} chars, {e_steps} steps)...")
-                                    state['phase'] = 'pretrain'
-                                    state['current_code'] = f'[expert {exp_id}] 0/{e_steps}'
-                                    refresh()
-
-                                    def _expert_cb(step, total, loss, _eid=exp_id):
-                                        state['current_code'] = f'[expert {_eid}] step {step}/{total}  loss={loss:.4f}'
-                                        refresh()
-                                    try:
-                                        treinar_expert(model, exp_id, texto_expert, e_steps, SUPERVISED_LR, status_callback=_expert_cb)
-                                        save_checkpoint(model, rl_opt, sup_opt, state, CHECKPOINT_LAST, pretrain_opt=pretrain_opt)
-                                        log(f'✅ Expert {exp_id} treinado e checkpoint salvo ({e_steps} steps)')
-                                    except (ValueError, RuntimeError) as e:
-                                        log(f'⚠️  Falha ao treinar expert {exp_id}: {e}')
-                                    state['phase'] = 'evolve'
-                                    state['current_code'] = ''
-                                    refresh()
-                except queue.Empty:
-                    pass
-                refresh(force=True)
-        except KeyboardInterrupt:
-            pass
+    def cb(step, total, loss):
+        n = step + 1
+        progresso['step'] = n
+        progresso['loss'] = loss
+        janela.append(loss)
+        avg = sum(janela) / len(janela)
+        progresso['avg'] = avg
+        if step % 50 == 0 or step == total - 1:
+            console.print(f'   step {n}/{total}  loss={loss:.4f}  média({len(janela)})={avg:.4f}')
+        if step > 0 and step % CHECKPOINT_EVERY == 0:
+            save_checkpoint(model, rl_opt, sup_opt, state, CHECKPOINT_LAST, pretrain_opt=pretrain_opt)
+        if n < max(LOSS_MIN_STEPS, LOSS_WINDOW):
+            return False
+        if avg <= LOSS_TARGET:
+            progresso['motivo'] = f'loss alvo atingido (média {avg:.4f} <= {LOSS_TARGET})'
+            return True
+        if avg < melhor['avg'] - LOSS_PLATEAU_MIN_DELTA:
+            melhor['avg'], melhor['step'] = avg, n
+        elif n - melhor['step'] >= LOSS_PLATEAU_PATIENCE:
+            progresso['motivo'] = f'platô (média sem cair {LOSS_PLATEAU_MIN_DELTA} há {LOSS_PLATEAU_PATIENCE} steps; melhor {melhor["avg"]:.4f})'
+            return True
+        return False
+    model.train()
+    try:
+        pretrain(model, steps, lr, cb, opt=pretrain_opt)
+    except KeyboardInterrupt:
+        progresso['motivo'] = 'interrupção manual / --max-minutes'
+        console.print('\n[yellow]⏹️  Interrompido — salvando o que já foi treinado...[/yellow]')
     console.print('\n[yellow]💾 Salvando checkpoint final...[/yellow]')
     save_checkpoint(model, rl_opt, sup_opt, state, CHECKPOINT_LAST, pretrain_opt=pretrain_opt)
     console.print('\n[bold blue]══ RESUMO FINAL ══[/bold blue]')
-    console.print(f'   Gerações: {state['gen']}')
-    console.print(f'   Melhor reward: {state['best_reward']:.2f}')
-    console.print(f'   Melhor código (gen {state['best_gen']}):')
-    console.print(f'   [bold cyan]{repr(state['best_code'])}[/bold cyan]')
-    console.print(f'   Arquitetura final: {state['config']}')
-    console.print(f'   Parâmetros: {state['n_params']:,}')
-    console.print(f'   Checkpoints em: [bold]{os.path.abspath(CHECKPOINT_DIR)}[/bold]')
-    console.print(f'   Habilidades premium: [bold magenta]{state['premium_count']}[/bold magenta] salvas em: [bold]{os.path.abspath(PREMIUM_DIR)}[/bold]\n')
-    console.print('[bold green]🧬 A IA evoluiu. Até a próxima![/bold green]\n')
+    console.print(f"   Steps rodados: {progresso['step']}/{steps}")
+    if progresso['loss'] is not None:
+        console.print(f"   Loss final: {progresso['loss']:.4f}  (média móvel: {progresso['avg']:.4f})")
+    console.print(f"   Parou por: {progresso['motivo']}")
+    console.print(f"   Arquitetura: {state['config']}")
+    console.print(f"   Parâmetros: {state['n_params']:,}")
+    console.print(f'   Checkpoint em: [bold]{os.path.abspath(_ckpt_path(CHECKPOINT_LAST))}[/bold]\n')
+    console.print('[bold green]✅ Treino concluído. Encerrando.[/bold green]\n')
 def _truncate_kv_cache(past_kv, max_len: int):
     """Corta o cache K/V pra caber no teto de CONTEXT_LEN — sem isso, uma
     geração longa o suficiente estoura o índice do pos_emb (que só tem
@@ -1706,7 +1155,7 @@ def _limpar_texto_wiki(texto: str) -> str:
     texto_limpo = _re.sub('\n{3,}', '\n\n', texto_limpo)
     return texto_limpo.strip()
 
-def _wiki_random_page_text(lang: str='pt'):
+def _wiki_random_page_text(lang: str='en'):
     if requests is None:
         raise RuntimeError("Pacote 'requests' não instalado. Rode: pip install requests")
     api_url = f'https://{lang}.wikipedia.org/w/api.php'
@@ -1724,7 +1173,7 @@ def _wiki_random_page_text(lang: str='pt'):
 # texto pra distribuir nos jobs; quem treina com isso são os voluntários.
 _wiki_cache_lock = threading.Lock()
 _wiki_cache: list = []       # fila de (title, texto) já buscados, prontos pra usar
-_WIKI_CACHE_TARGET = 5        # quantas páginas manter prontas no buffer
+_WIKI_CACHE_TARGET = 10       # quantas páginas manter prontas no buffer
 _WIKI_MODE = False            # setado por run_server(wiki=True)
 WIKI_CORPUS_DIR = './wiki_corpus'  # cada página vira um .txt aqui — substrato pra RAG/replay no chat.py
 
@@ -1863,8 +1312,37 @@ def _sample_batch_local(encoded: torch.Tensor, context_len: int, dev):
     return x, y
 
 
+# Páginas recentes já treinadas (título, tensor codificado) — usado pra
+# misturar exemplos "antigos" no batch de treino da página atual, em vez de
+# treinar isolado nela. Sem isso, cada página nova ia sobrescrevendo o que
+# foi aprendido nas anteriores (é o que causava o modelo "grudar" no último
+# assunto visto, não importa o prompt).
+_replay_buffer: deque = deque(maxlen=REPLAY_BUFFER_MAX_PAGES)
+
+
+def _sample_batch_misto(encoded_atual: torch.Tensor, buffer_replay: list, context_len: int, dev,
+                         bs: int = REPLAY_BATCH_SIZE, fracao_replay: float = REPLAY_FRACTION):
+    """Monta um batch misturando janelas da página atual com janelas de
+    páginas antigas do buffer de replay. Sempre garante pelo menos 1 exemplo
+    da página atual (senão não haveria treino nela)."""
+    n_replay = min(int(round(bs * fracao_replay)), bs - 1) if buffer_replay else 0
+    n_atual = bs - n_replay
+    encodeds = [encoded_atual] * n_atual + [random.choice(buffer_replay)[1] for _ in range(n_replay)]
+    xs, ys = [], []
+    for enc in encodeds:
+        if len(enc) <= context_len + 1:
+            continue
+        i = torch.randint(0, len(enc) - context_len - 1, (1,)).item()
+        xs.append(enc[i:i + context_len])
+        ys.append(enc[i + 1:i + context_len + 1])
+    if not xs:
+        return None, None
+    return torch.stack(xs).to(dev), torch.stack(ys).to(dev)
+
+
 def _local_training_direct(model: 'TinyAI', pretrain_opt, rl_opt, sup_opt, state: dict,
-                            loss_target: float = 0.7, max_steps_por_pagina: int = 2000):
+                            loss_target: float = LOCAL_TRAIN_LOSS_TARGET,
+                            max_steps_por_pagina: int = LOCAL_TRAIN_MAX_STEPS_POR_PAGINA):
     """Treino local DIRETO no modelo mestre — sem cópia extra, sem
     compressão de pesos (isso é o que pesava em RAM no modo via job
     federado, que existe pra simular um voluntário de verdade isolado).
@@ -1896,7 +1374,8 @@ def _local_training_direct(model: 'TinyAI', pretrain_opt, rl_opt, sup_opt, state
                     sup_opt = torch.optim.AdamW(model.parameters(), lr=SUPERVISED_LR)
                     local_vocab_epoch = _VOCAB_EPOCH
                 console.print("[cyan]🔄 Vocab mudou — optimizer reconstruído (evita vazamento de memória)[/cyan]")
-            x, y = _sample_batch_local(encoded, CONTEXT_LEN, device)
+            x, y = _sample_batch_misto(encoded, list(_replay_buffer), CONTEXT_LEN, device,
+                                        fracao_replay=REPLAY_FRACTION if _replay_buffer else 0.0)
             if x is None:
                 break
             with _server_lock:
@@ -1907,15 +1386,17 @@ def _local_training_direct(model: 'TinyAI', pretrain_opt, rl_opt, sup_opt, state
                 pretrain_opt.step()
             last_loss = loss.item()
             step += 1
-            if step == 1 or step % 5 == 0:
+            if step == 1 or step % 1 == 0:
                 console.print(f'   step {step}  loss={last_loss:.4f}')
             if last_loss <= loss_target:
                 break
         with _server_lock:
             state['gen'] = state.get('gen', 0) + 1
             save_checkpoint(model, rl_opt, sup_opt, state, CHECKPOINT_LAST, pretrain_opt=pretrain_opt)
+        _replay_buffer.append((title, encoded))
         motivo = 'atingiu loss alvo' if last_loss is not None and last_loss <= loss_target else 'limite de steps'
-        console.print(f"[bold green]✅ '{title}' concluída ({motivo}) — loss final={last_loss:.4f}, {step} steps. Checkpoint salvo.[/bold green]")
+        console.print(f"[bold green]✅ '{title}' concluída ({motivo}) — loss final={last_loss:.4f}, {step} steps. "
+                       f"Checkpoint salvo. (replay buffer: {len(_replay_buffer)} páginas)[/bold green]")
 
 
 def run_server(wiki: bool=False, host: str='0.0.0.0', port: int=5000, federated: bool=False, training_local: bool=False):
@@ -1953,7 +1434,34 @@ def run_server(wiki: bool=False, host: str='0.0.0.0', port: int=5000, federated:
     app.run(host=host, port=port, threaded=True)
 
 
+def _setup_time_limit(argv):
+    """Configura um alarme para interromper o processo graciosamente após
+    N minutos, disparando um KeyboardInterrupt no thread principal.
+    O loop de treino já trata KeyboardInterrupt salvando o checkpoint final
+    e encerrando sozinho — então isso resolve o problema do Kaggle nunca
+    considerar o processo 'terminado' em modos que rodam para sempre.
+    Uso: python ia_server.py --max-minutes 120
+    (funciona também combinado com --serve, --wiki, --training-local etc.)
+    """
+    if '--max-minutes' not in argv:
+        return
+    try:
+        minutos = float(argv[argv.index('--max-minutes') + 1])
+    except (ValueError, IndexError):
+        console.print('[bold red]❌ --max-minutes precisa de um número (ex: --max-minutes 120)[/bold red]')
+        return
+
+    def _time_up(signum, frame):
+        console.print(f'\n[bold yellow]⏰ Tempo limite de {minutos:.0f} min atingido — encerrando graciosamente...[/bold yellow]')
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGALRM, _time_up)
+    signal.alarm(int(minutos * 60))
+    console.print(f'[bold blue]⏱️  Auto-encerramento configurado para {minutos:.0f} minutos[/bold blue]')
+
+
 if __name__ == '__main__':
+    _setup_time_limit(sys.argv)
     if '--serve' in sys.argv:
         _port = 5000
         if '--port' in sys.argv:
